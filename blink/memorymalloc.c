@@ -51,7 +51,9 @@ struct Allocator {
 };
 
 struct Machine g_bssmachine;
-struct HostPages g_hostpages;
+struct HostPages g_hostpages = {
+    PTHREAD_MUTEX_INITIALIZER_,
+};
 
 static void FillPage(void *p, int c) {
   memset(p, c, 4096);
@@ -71,18 +73,24 @@ static void FreeHostPage(struct HostPage *hp) {
 
 static u64 TrackHostPage(u8 *ptr) {
   u64 entry;
+  u8 **chunk;
+  size_t index;
   if (HasLinearMapping()) {
     return (uintptr_t)ptr;
   } else {
-    if (g_hostpages.n == g_hostpages.c) {
-      g_hostpages.c += 1;
-      g_hostpages.c += g_hostpages.c >> 1;
-      g_hostpages.p =
-          realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
-    }
+    LOCK(&g_hostpages.lock);
     entry = g_hostpages.n++;
-    g_hostpages.p[entry] = ptr;
-    return entry << 12;
+    index = entry;
+    unassert(index < kHostPageTableCapacity);
+    chunk = g_hostpages.chunks[index >> kHostPageChunkBits];
+    if (!chunk) {
+      chunk = (u8 **)calloc(kHostPageChunkSize, sizeof(*chunk));
+      unassert(chunk);
+      g_hostpages.chunks[index >> kHostPageChunkBits] = chunk;
+    }
+    chunk[index & kHostPageChunkMask] = ptr;
+    UNLOCK(&g_hostpages.lock);
+    return (entry << 12) | PAGE_HIDX;
   }
 }
 
@@ -477,7 +485,7 @@ u64 AllocateAnonymousPage(struct System *s) {
 Finished:
   s->rss += 1;
   i = TrackHostPage(page);
-  unassert(!(i & ~PAGE_TA));
+  unassert(!(i & ~(PAGE_TA | PAGE_HIDX)));
   return i | PAGE_HOST | PAGE_U | PAGE_RW | PAGE_V;
 }
 
@@ -996,7 +1004,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
           } else {
             real = (uintptr_t)ToHost(virt);
           }
-          unassert(!(real & ~PAGE_TA));
+          unassert(!(real & ~(PAGE_TA | PAGE_HIDX)));
           entry = real | flags | PAGE_V;
         } else {
           entry = flags | PAGE_V;

@@ -98,6 +98,7 @@
 #define PAGE_HOST  0x0000000000000400  // PAGE_TA bits point to system memory
 #define PAGE_MAP   0x0000000000000800  // PAGE_TA bits are a linear host mmap
 #define PAGE_TA    0x0000fffffffff000  // bits used for host, or real address
+#define PAGE_HIDX  0x0001000000000000  // PAGE_TA bits are a g_hostpages index
 #define PAGE_GROW  0x0010000000000000  // for future support of MAP_GROWSDOWN
 #define PAGE_MUG   0x0020000000000000  // host page magic mapped individually
 #define PAGE_FILE  0x0040000000000000  // page has tracking bit in s->filemap
@@ -165,10 +166,18 @@ struct HostPage {
   struct HostPage *next;
 };
 
+#define kHostPageChunkBits      10
+#define kHostPageChunkSize      (1u << kHostPageChunkBits)
+#define kHostPageChunkMask      (kHostPageChunkSize - 1)
+#define kHostPageDirectoryBits  14
+#define kHostPageDirectorySize  (1u << kHostPageDirectoryBits)
+#define kHostPageTableCapacity  \
+  ((size_t)kHostPageDirectorySize * (size_t)kHostPageChunkSize)
+
 struct HostPages {
+  pthread_mutex_t_ lock;
   size_t n;
-  size_t c;
-  u8 **p;
+  u8 **chunks[kHostPageDirectorySize];
 };
 
 struct PageLock {
@@ -839,10 +848,15 @@ MICRO_OP_SAFE u8 Cpl(struct Machine *m) {
   }
 
 static inline u8 *FindHostPage(u64 entry) {
-  if (HasLinearMapping()) {
-    return (u8 *)(uintptr_t)(entry & PAGE_TA);
+  if (entry & PAGE_HIDX) {
+    size_t index = (entry & PAGE_TA) >> 12;
+    u8 **chunk;
+    unassert(index < kHostPageTableCapacity);
+    chunk = g_hostpages.chunks[index >> kHostPageChunkBits];
+    unassert(chunk);
+    return chunk[index & kHostPageChunkMask];
   } else {
-    return g_hostpages.p[(entry & PAGE_TA) >> 12];
+    return (u8 *)(uintptr_t)(entry & PAGE_TA);
   }
 }
 

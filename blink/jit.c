@@ -997,7 +997,7 @@ static unsigned RehashJitHooks(struct Jit *jit) {
   // update the hash table pointers for the lockless reader
   kgen = BeginUpdate(&jit->keygen);
   atomic_store_explicit(&jit->hooks.virts, virts2, memory_order_release);
-  atomic_store_explicit(&jit->hooks.funcs, funcs2, memory_order_relaxed);
+  atomic_store_explicit(&jit->hooks.funcs, funcs2, memory_order_release);
   atomic_store_explicit(&jit->hooks.n, n2, memory_order_release);
   EndUpdate(&jit->keygen, kgen);
   // leak old table so failed reads won't segfault from free munmap
@@ -1101,15 +1101,15 @@ uintptr_t GetJitHook(struct Jit *jit, u64 virt) {
   COSTLY_STATISTIC(++jit_hash_lookups);
   hash = HASH(virt);
   do {
-    kgen = atomic_load_explicit(&jit->keygen, memory_order_relaxed);
-    n = atomic_load_explicit(&jit->hooks.n, memory_order_relaxed);
+    kgen = atomic_load_explicit(&jit->keygen, memory_order_acquire);
+    n = atomic_load_explicit(&jit->hooks.n, memory_order_acquire);
     virts = atomic_load_explicit(&jit->hooks.virts, memory_order_acquire);
+    funcs = atomic_load_explicit(&jit->hooks.funcs, memory_order_acquire);
     for (spot = step = 0;; ++step) {
       spot = (hash + step * ((step + 1) >> 1)) & (n - 1);
       key = atomic_load_explicit(virts + spot, memory_order_acquire);
       if (key == virt) {
-        funcs = atomic_load_explicit(&jit->hooks.funcs, memory_order_relaxed);
-        off = atomic_load_explicit(funcs + spot, memory_order_relaxed);
+        off = atomic_load_explicit(funcs + spot, memory_order_acquire);
         res = off ? DecodeJitFunc(off) : 0;
         break;
       }

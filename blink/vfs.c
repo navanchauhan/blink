@@ -137,7 +137,7 @@ static int VfsWrapGuestFd(int guestfd, int hostfd, bool dodup) {
 
 int VfsInitRootMount(const char *source, const char *fstype, u64 flags,
                      const void *data, bool mount_system_root,
-                     const char *cwd) {
+                     bool inherit_host_fds, const char *cwd) {
   struct VfsInfo *info;
   struct VfsMount *rootmount;
   int fd;
@@ -209,13 +209,17 @@ int VfsInitRootMount(const char *source, const char *fstype, u64 flags,
   unassert(!VfsWrapGuestFd(1, 1, true));
   unassert(!VfsWrapGuestFd(2, 2, true));
 
-  // Some Linux tests require that when EMFILE occurs,
-  // the fd returned before it must be the maximum possible.
+  if (inherit_host_fds) {
+    // Some Linux tests require that when EMFILE occurs,
+    // the fd returned before it must be the maximum possible.
 
-  // Force initialization of the logger fd.
-  LogInfo(__FILE__, __LINE__, "Initializing VFS");
-  for (fd = kMinBlinkFd; HostfsWrapFd(fd, false, &info) != -1; ++fd) {
-    unassert(!VfsSetFd(fd, info));
+    // Force initialization of the logger fd.
+    LogInfo(__FILE__, __LINE__, "Initializing VFS");
+    for (fd = kMinBlinkFd; HostfsWrapFd(fd, false, &info) != -1; ++fd) {
+      unassert(!VfsSetFd(fd, info));
+    }
+  } else {
+    LogInfo(__FILE__, __LINE__, "Initializing isolated VFS");
   }
 
   VFS_LOGF("Initialized VFS");
@@ -285,7 +289,7 @@ int VfsInit(const char *prefix) {
   }
 
   rc = VfsInitRootMount(bprefix ? bprefix : "/", "hostfs", 0, NULL,
-                        mounts_system_root, cwd);
+                        mounts_system_root, true, cwd);
   free(cwd);
   free(bprefix);
   return rc;
@@ -872,6 +876,21 @@ int VfsGetFd(int fd, struct VfsInfo **output) {
   }
   UNLOCK(&g_vfs.lock);
   return ebadf();
+}
+
+int VfsNextFd(int fd) {
+  struct Dll *e;
+  LOCK(&g_vfs.lock);
+  for (e = dll_first(g_vfs.fds); e; e = dll_next(g_vfs.fds, e)) {
+    if (VFS_FD_CONTAINER(e)->fd > fd) {
+      int nextfd = VFS_FD_CONTAINER(e)->fd;
+      UNLOCK(&g_vfs.lock);
+      return nextfd;
+    }
+  }
+  UNLOCK(&g_vfs.lock);
+  errno = ENOENT;
+  return -1;
 }
 
 int VfsSetFd(int fd, struct VfsInfo *data) {
@@ -1466,6 +1485,7 @@ ssize_t VfsReadlink(int dirfd, const char *name, char *buf, size_t bufsiz) {
     if (VfsHandleDirfdName(dirfd, name, &dir, newname) == -1) {
       return -1;
     }
+    unassert(!VfsTraverseMount(&dir, newname));
     if (!dir->device->ops->Finddir ||
         dir->device->ops->Finddir(dir, newname, &file) == -1) {
       unassert(!VfsFreeInfo(dir));

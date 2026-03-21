@@ -97,13 +97,14 @@ u64 HandlePageFault(struct Machine *m, u8 *pslot, u64 entry) {
         entry = 0;
         break;
       }
-      x = (page & (PAGE_TA | PAGE_HOST)) | (entry & ~(PAGE_TA | PAGE_RSRV));
+      x = (page & (PAGE_TA | PAGE_HOST | PAGE_HIDX)) |
+          (entry & ~(PAGE_TA | PAGE_RSRV));
       if (CasPte(pslot, entry, x)) {
         m->system->memstat.committed += 1;
         m->system->memstat.reserved -= 1;
         entry = x;
       } else {
-        FreeAnonymousPage(m->system, (u8 *)(uintptr_t)(page & PAGE_TA));
+        FreeAnonymousPage(m->system, FindHostPage(page));
         entry = LoadPte(pslot);
         m->system->rss -= 1;
       }

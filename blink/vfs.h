@@ -276,11 +276,12 @@ int VfsMunmap(void *, size_t);
 int VfsMprotect(void *, size_t, int);
 int VfsMsync(void *, size_t, int);
 
-int VfsInitRootMount(const char *, const char *, u64, const void *, bool,
+int VfsInitRootMount(const char *, const char *, u64, const void *, bool, bool,
                      const char *);
 void VfsResetForReuse(void);
 void VfsCloseAll(void);
 int VfsInit(const char *);
+int VfsNextFd(int);
 int VfsRegister(struct VfsSystem *);
 int VfsTraverse(const char *, struct VfsInfo **, bool);
 int VfsCreateInfo(struct VfsInfo **);
@@ -291,6 +292,7 @@ int VfsFreeDevice(struct VfsDevice *);
 int VfsFreeInfo(struct VfsInfo *);
 int VfsAddFd(struct VfsInfo *);
 int VfsFreeFd(int, struct VfsInfo **);
+int VfsGetFd(int, struct VfsInfo **);
 int VfsSetFd(int, struct VfsInfo *);
 ssize_t VfsPathBuildFull(struct VfsInfo *, struct VfsInfo *, char **);
 ssize_t VfsPathBuild(struct VfsInfo *, struct VfsInfo *, bool,
