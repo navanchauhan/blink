@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include <errno.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,14 @@ u8 *GetPageAddress(struct System *s, u64 entry, bool is_cr3) {
   unassert(is_cr3 || (entry & PAGE_V));
   unassert(~entry & PAGE_RSRV);
   if (entry & PAGE_HOST) {
+    if (!HasLinearMapping() && !(entry & PAGE_HIDX)) {
+      fprintf(stderr,
+              "[blink] non-linear PAGE_HOST entry missing PAGE_HIDX: "
+              "entry=%#" PRIx64 "\n",
+              entry);
+      fflush(stderr);
+      unassert(entry & PAGE_HIDX);
+    }
     return FindHostPage(entry);
   } else {
     unassert(s->real);
@@ -169,6 +178,17 @@ void CollectPageLocks(struct Machine *m) {
     LOCK(&m->system->pagelocks_lock);
     do ReleasePageLock(m->pagelocks.p[--m->pagelocks.i].pslot);
     while (HasOutdatedPageLocks(m));
+    unassert(!pthread_cond_broadcast(&m->system->pagelocks_cond));
+    UNLOCK(&m->system->pagelocks_lock);
+  }
+}
+
+void FlushPageLocks(struct Machine *m) {
+  if (m->pagelocks.i) {
+    LOCK(&m->system->pagelocks_lock);
+    while (m->pagelocks.i) {
+      ReleasePageLock(m->pagelocks.p[--m->pagelocks.i].pslot);
+    }
     unassert(!pthread_cond_broadcast(&m->system->pagelocks_cond));
     UNLOCK(&m->system->pagelocks_lock);
   }

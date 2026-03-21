@@ -63,6 +63,8 @@
 #include "blink/debug.h"
 #include "blink/endian.h"
 #include "blink/errno.h"
+#include "blink/epollfd.h"
+#include "blink/eventfd.h"
 #include "blink/flag.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
@@ -281,6 +283,11 @@ bool CheckInterrupt(struct Machine *m, bool restartable) {
   int sig, delivered;
   // an actual i/o call just received EINTR from the kernel
 HandleSomeMoreInterrupts:
+  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
+    errno = EINTR;
+    m->interrupted = true;
+    return true;
+  }
   // determine if there's any signals pending for our guest
   Put64(m->ax, -EINTR_LINUX);
   if ((sig = ConsumeSignal(m, &delivered, &restart))) {
@@ -682,6 +689,7 @@ static int SysFutexWait(struct Machine *m,  //
                         u32 expect,         //
                         i64 timeout_addr) {
   int rc;
+  u32 current;
   u8 *mem;
   struct Futex *f;
   const struct timespec_linux *gtimeout;
@@ -702,8 +710,10 @@ static int SysFutexWait(struct Machine *m,  //
     deadline = GetMaxTime();
   }
   if (!(mem = LookupAddress(m, uaddr))) return -1;
+  current = Load32(mem);
+  FlushPageLocks(m);
   LOCK(&g_bus->futexes.lock);
-  if (Load32(mem) != expect) {
+  if (current != expect) {
     UNLOCK(&g_bus->futexes.lock);
     return eagain();
   }
@@ -736,8 +746,10 @@ static int SysFutexWait(struct Machine *m,  //
       rc = errno;
       break;
     }
+    current = Load32(mem);
+    FlushPageLocks(m);
     LOCK(&f->lock);
-    if (Load32(mem) != expect) {
+    if (current != expect) {
       rc = 0;
     } else {
       tick = AddTime(tick, FromMilliseconds(kPollingMs));
@@ -1042,6 +1054,10 @@ static int SysPrctl(struct Machine *m, int op, i64 arg2, i64 arg3, i64 arg4,
       return einval();
     default:
     DefaultCase:
+      if (getenv("OMNIKIT_BLINK_VM_TRACE") != NULL) {
+        fprintf(stderr, "[vmtrace:prctl-unsupported] op=%#x\n", op);
+        fflush(stderr);
+      }
       LOGF("unsupported %s op %#x", "prctl", op);
       return einval();
   }
@@ -1072,6 +1088,12 @@ static int SysArchPrctl(struct Machine *m, int op, i64 addr) {
       return 0;
 #endif
     default:
+      if (getenv("OMNIKIT_BLINK_VM_TRACE") != NULL) {
+        fprintf(stderr,
+                "[vmtrace:arch_prctl-unsupported] op=%#x addr=%#" PRIx64 "\n",
+                op, addr);
+        fflush(stderr);
+      }
       LOGF("unsupported %s op %#x", "arch_prctl", op);
       return einval();
   }
@@ -1092,6 +1114,10 @@ static int SysMprotect(struct Machine *m, i64 addr, u64 size, int prot) {
   _Static_assert(PROT_EXEC == 4, "");
   int rc;
   int unsupported;
+  bool trace_exec;
+  bool trace_vm;
+  trace_exec = getenv("OMNIKIT_BLINK_EXEC_TRACE") != NULL;
+  trace_vm = getenv("OMNIKIT_BLINK_VM_TRACE") != NULL;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
   if (!IsValidAddrSize(addr, size)) return einval();
   if ((unsupported = prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))) {
@@ -1101,6 +1127,18 @@ static int SysMprotect(struct Machine *m, i64 addr, u64 size, int prot) {
   BEGIN_NO_PAGE_FAULTS;
   LOCK(&m->system->mmap_lock);
   rc = ProtectVirtual(m->system, addr, size, prot, false);
+  if (trace_vm) {
+    fprintf(stderr, "[vmtrace:mprotect] addr=%#" PRIx64 " size=%#" PRIx64
+                    " prot=%#x rc=%d\n",
+            addr, size, prot, rc);
+    fflush(stderr);
+  }
+  if (trace_exec && ((prot & PROT_EXEC) || rc == -1)) {
+    fprintf(stderr,
+            "[mprotect] addr=%#" PRIx64 " size=%#" PRIx64 " prot=%#x rc=%d\n",
+            addr, size, prot, rc);
+    fflush(stderr);
+  }
   unassert(CheckMemoryInvariants(m->system));
   UNLOCK(&m->system->mmap_lock);
   END_NO_PAGE_FAULTS;
@@ -1108,6 +1146,12 @@ static int SysMprotect(struct Machine *m, i64 addr, u64 size, int prot) {
 }
 
 static int SysMadvise(struct Machine *m, i64 addr, u64 len, int advice) {
+  if (getenv("OMNIKIT_BLINK_VM_TRACE") != NULL) {
+    fprintf(stderr, "[vmtrace:madvise] addr=%#" PRIx64 " len=%#" PRIx64
+                    " advice=%d\n",
+            addr, len, advice);
+    fflush(stderr);
+  }
   return 0;
 }
 
@@ -1161,9 +1205,17 @@ static i64 SysBrk(struct Machine *m, i64 addr) {
 
 static int SysMunmap(struct Machine *m, i64 virt, u64 size) {
   int rc;
+  bool trace_vm;
+  trace_vm = getenv("OMNIKIT_BLINK_VM_TRACE") != NULL;
   BEGIN_NO_PAGE_FAULTS;
   LOCK(&m->system->mmap_lock);
   rc = FreeVirtual(m->system, virt, size);
+  if (trace_vm) {
+    fprintf(stderr, "[vmtrace:munmap] addr=%#" PRIx64 " size=%#" PRIx64
+                    " rc=%d\n",
+            virt, size, rc);
+    fflush(stderr);
+  }
   unassert(CheckMemoryInvariants(m->system));
   UNLOCK(&m->system->mmap_lock);
   END_NO_PAGE_FAULTS;
@@ -1269,22 +1321,258 @@ Finished:
 static i64 SysMmap(struct Machine *m, i64 virt, u64 size, int prot, int flags,
                    int fildes, i64 offset) {
   i64 res;
+  bool trace_exec;
+  bool trace_vm;
+  trace_exec = getenv("OMNIKIT_BLINK_EXEC_TRACE") != NULL;
+  trace_vm = getenv("OMNIKIT_BLINK_VM_TRACE") != NULL;
   BEGIN_NO_PAGE_FAULTS;
   LOCK(&m->system->mmap_lock);
   res = SysMmapImpl(m, virt, size, prot, flags, fildes, offset);
+  if (trace_vm) {
+    fprintf(stderr,
+            "[vmtrace:mmap] addr=%#" PRIx64 " size=%#" PRIx64 " prot=%#x"
+            " flags=%#x fd=%d off=%#" PRIx64 " -> %#" PRIx64 "\n",
+            virt, size, prot, flags, fildes, offset, res);
+    fflush(stderr);
+  }
+  if (trace_exec && ((prot & PROT_EXEC) || res == -1)) {
+    fprintf(stderr,
+            "[mmap] addr=%#" PRIx64 " size=%#" PRIx64 " prot=%#x flags=%#x"
+            " fd=%d off=%#" PRIx64 " -> %#" PRIx64 "\n",
+            virt, size, prot, flags, fildes, offset, res);
+    fflush(stderr);
+  }
   unassert(CheckMemoryInvariants(m->system));
   UNLOCK(&m->system->mmap_lock);
   END_NO_PAGE_FAULTS;
   return res;
 }
 
+static u64 PeekPageTableEntryRaw(struct System *s, i64 virt) {
+  u8 *mi;
+  u64 pt;
+  i64 ti, level;
+  for (pt = s->cr3, level = 39; level >= 12; level -= 9) {
+    ti = (virt >> level) & 511;
+    if (!(mi = GetPageAddress(s, pt, level == 39))) {
+      return 0;
+    }
+    mi += ti * 8;
+    pt = LoadPte(mi);
+    if (!(pt & PAGE_V)) {
+      return 0;
+    }
+    if ((pt & PAGE_PS) && level > 12) {
+      u64 submask = ((u64)1 << level) - 4096;
+      pt &= ~submask;
+      pt |= (u64)virt & submask;
+      break;
+    }
+  }
+  return pt;
+}
+
+static int GetMremapKey(struct Machine *m, i64 addr, u64 size, u64 *out_key) {
+  bool have_key;
+  i64 virt, end;
+  u64 entry, key;
+  struct FileMap *fm;
+  if (out_key == NULL) {
+    return efault();
+  }
+  *out_key = 0;
+  fm = GetFileMap(m->system, addr);
+  if (fm && fm->path && fm->path[0] && fm->path[0] != '[') {
+    LOG_ONCE(MEM_LOGF("mremap() file-backed mappings not supported yet"));
+    return enomem();
+  }
+  have_key = false;
+  for (virt = addr, end = addr + size; virt < end; virt += 4096) {
+    if (!(entry = PeekPageTableEntryRaw(m->system, virt))) {
+      errno = EFAULT;
+      return -1;
+    }
+    entry &= PAGE_RW | PAGE_U | PAGE_XD | PAGE_GROW;
+    if (!have_key) {
+      key = entry;
+      have_key = true;
+    } else if (entry != key) {
+      LOG_ONCE(MEM_LOGF("mremap() mixed-protection mappings not supported yet"));
+      return enomem();
+    }
+  }
+  *out_key = key;
+  return 0;
+}
+
+static int CopyMremapPages(struct Machine *m, i64 dst, i64 src, u64 size) {
+  bool nofault;
+  i64 virt, end;
+  u64 entry;
+  u8 *src_page, *dst_page;
+  nofault = m->nofault;
+  m->nofault = false;
+  for (virt = 0, end = size; virt < end; virt += 4096) {
+    if (!(entry = PeekPageTableEntryRaw(m->system, src + virt))) {
+      errno = EFAULT;
+      m->nofault = nofault;
+      return -1;
+    }
+    if (entry & PAGE_RSRV) {
+      continue;
+    }
+    if (!(src_page = SpyAddress(m, src + virt)) ||
+        !(dst_page = SpyAddress(m, dst + virt))) {
+      m->nofault = nofault;
+      return -1;
+    }
+    memcpy(dst_page, src_page, MIN(4096, end - virt));
+    FlushPageLocks(m);
+  }
+  FlushPageLocks(m);
+  m->nofault = nofault;
+  return 0;
+}
+
+static bool OverlapsMapping(i64 a, u64 asize, i64 b, u64 bsize) {
+  return a < b + bsize && b < a + asize;
+}
+
 static i64 SysMremap(struct Machine *m, i64 old_address, u64 old_size,
                      u64 new_size, int flags, i64 new_address) {
-  // would be nice to have
-  // avoid being noisy in the logs
-  // hope program has fallback for failure
-  LOG_ONCE(MEM_LOGF("mremap() not supported yet"));
-  return enomem();
+  i64 rc;
+  i64 target;
+  i64 newautomap;
+  u64 key;
+  u64 old_rounded;
+  u64 new_rounded;
+  int unsupported;
+  bool trace_mremap;
+  trace_mremap = getenv("OMNIKIT_BLINK_MREMAP_TRACE") != NULL;
+  if (trace_mremap) {
+    fprintf(stderr,
+            "[mremap] enter old=%#" PRIx64 " old_size=%#" PRIx64
+            " new_size=%#" PRIx64 " flags=%#x new_address=%#" PRIx64 "\n",
+            old_address, old_size, new_size, flags, new_address);
+    fflush(stderr);
+  }
+  if (old_size > NUMERIC_MAX(i64) || new_size > NUMERIC_MAX(i64)) {
+    return eoverflow();
+  }
+  if (!old_size || !new_size || (old_address & 4095)) {
+    return einval();
+  }
+  if ((unsupported = flags & ~(MREMAP_MAYMOVE_LINUX | MREMAP_FIXED_LINUX |
+                               MREMAP_DONTUNMAP_LINUX))) {
+    LOGF("unsupported mremap() flags %#x", unsupported);
+    return einval();
+  }
+  if ((flags & MREMAP_FIXED_LINUX) && !(flags & MREMAP_MAYMOVE_LINUX)) {
+    return einval();
+  }
+  if (flags & MREMAP_DONTUNMAP_LINUX) {
+    LOG_ONCE(MEM_LOGF("mremap(MREMAP_DONTUNMAP) not supported yet"));
+    return einval();
+  }
+  old_rounded = ROUNDUP(old_size, 4096);
+  new_rounded = ROUNDUP(new_size, 4096);
+  if (!IsValidAddrSize(old_address, old_rounded)) {
+    return einval();
+  }
+  if (flags & MREMAP_FIXED_LINUX) {
+    if ((new_address & 4095) || !IsValidAddrSize(new_address, new_rounded)) {
+      return einval();
+    }
+  }
+  BEGIN_NO_PAGE_FAULTS;
+  LOCK(&m->system->mmap_lock);
+  if (GetMremapKey(m, old_address, old_rounded, &key) == -1) {
+    rc = -1;
+    goto Finished;
+  }
+  if (trace_mremap) {
+    fprintf(stderr,
+            "[mremap] rounded old=%#" PRIx64 " new=%#" PRIx64 " key=%#" PRIx64
+            "\n",
+            old_rounded, new_rounded, key);
+    fflush(stderr);
+  }
+  if (!(flags & MREMAP_FIXED_LINUX) && new_rounded == old_rounded) {
+    rc = old_address;
+    goto Finished;
+  }
+  if (!(flags & MREMAP_FIXED_LINUX) && new_rounded < old_rounded) {
+    if (new_rounded < old_rounded &&
+        FreeVirtual(m->system, old_address + new_rounded,
+                    old_rounded - new_rounded) == -1) {
+      rc = -1;
+    } else {
+      rc = old_address;
+    }
+    goto Finished;
+  }
+  if (!(flags & MREMAP_FIXED_LINUX) && new_rounded > old_rounded &&
+      IsFullyUnmapped(m->system, old_address + old_rounded,
+                      new_rounded - old_rounded) &&
+      ReserveVirtual(m->system, old_address + old_rounded,
+                     new_rounded - old_rounded, key, -1, 0, false, true) !=
+          -1) {
+    rc = old_address;
+    goto Finished;
+  }
+  if (!(flags & MREMAP_MAYMOVE_LINUX)) {
+    rc = enomem();
+    goto Finished;
+  }
+  if (flags & MREMAP_FIXED_LINUX) {
+    target = new_address;
+    if (target != old_address &&
+        OverlapsMapping(old_address, old_rounded, target, new_rounded)) {
+      rc = einval();
+      goto Finished;
+    }
+  } else {
+    if ((target = FindVirtual(m->system, m->system->automap, new_rounded)) ==
+        -1) {
+      rc = -1;
+      goto Finished;
+    }
+    newautomap = ROUNDUP(target + new_rounded, FLAG_pagesize);
+    if (newautomap >= FLAG_automapend) {
+      newautomap = FLAG_automapstart;
+    }
+    m->system->automap = newautomap;
+  }
+  if (target == old_address) {
+    rc = new_rounded < old_rounded ? old_address : enomem();
+    goto Finished;
+  }
+  if (ReserveVirtual(m->system, target, new_rounded, key, -1, 0, false,
+                     !!(flags & MREMAP_FIXED_LINUX)) == -1) {
+    rc = -1;
+    goto Finished;
+  }
+  if (CopyMremapPages(m, target, old_address,
+                      MIN(old_rounded, new_rounded)) == -1) {
+    unassert(!FreeVirtual(m->system, target, new_rounded));
+    rc = -1;
+    goto Finished;
+  }
+  if (FreeVirtual(m->system, old_address, old_rounded) == -1) {
+    unassert(!FreeVirtual(m->system, target, new_rounded));
+    rc = -1;
+    goto Finished;
+  }
+  rc = target;
+Finished:
+  if (trace_mremap) {
+    fprintf(stderr, "[mremap] exit rc=%#" PRIx64 "\n", rc);
+    fflush(stderr);
+  }
+  unassert(CheckMemoryInvariants(m->system));
+  UNLOCK(&m->system->mmap_lock);
+  END_NO_PAGE_FAULTS;
+  return rc;
 }
 
 static int XlatMsyncFlags(int flags) {
@@ -3577,10 +3865,21 @@ static void ExecveBlink(struct Machine *m, char *prog, char **argv,
 }
 
 static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
+  int i;
   char *prog, **argv, **envp;
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
+  if (getenv("OMNIKIT_DEBUG_EXECVE")) {
+    fprintf(stderr, "[execve] prog=%s\n", prog ? prog : "(null)");
+    for (i = 0; argv && argv[i]; ++i) {
+      fprintf(stderr, "[execve] argv[%d]=%s\n", i, argv[i]);
+    }
+    for (i = 0; envp && envp[i] && i < 8; ++i) {
+      fprintf(stderr, "[execve] envp[%d]=%s\n", i, envp[i]);
+    }
+    fflush(stderr);
+  }
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
   SYS_LOGF("execve(%s)", prog);
@@ -4889,6 +5188,12 @@ static int SysSigpending(struct Machine *m, i64 setaddr) {
 }
 
 static int SysKill(struct Machine *m, int pid, int sig) {
+  if (getenv("OMNIKIT_BLINK_SIGNAL_TRACE") && sig) {
+    fprintf(stderr,
+            "[signal-trace:kill] tid=%d pid=%d target_pid=%d sig=%d host_sig=%d ip=%#" PRIx64 "\n",
+            m->tid, m->system->pid, pid, sig, XlatSignal(sig), m->ip);
+    fflush(stderr);
+  }
   return kill(pid, sig ? XlatSignal(sig) : 0);
 }
 
@@ -4901,6 +5206,12 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
 #if defined(HAVE_FORK) || defined(HAVE_THREADS)
   bool found;
   int rc, err;
+  if (getenv("OMNIKIT_BLINK_SIGNAL_TRACE") && sig) {
+    fprintf(stderr,
+            "[signal-trace:tkill] tid=%d target_tid=%d sig=%d ip=%#" PRIx64 "\n",
+            m->tid, tid, sig, m->ip);
+    fflush(stderr);
+  }
   if (tid < 0) return einval();
   if (!(0 <= sig && sig <= 64)) {
     LOGF("tkill(%d, %d) failed due to bogus signal", tid, sig);
@@ -4980,6 +5291,12 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
 }
 
 static int SysTgkill(struct Machine *m, int pid, int tid, int sig) {
+  if (getenv("OMNIKIT_BLINK_SIGNAL_TRACE") && sig) {
+    fprintf(stderr,
+            "[signal-trace:tgkill] tid=%d pid=%d target_pid=%d target_tid=%d sig=%d ip=%#" PRIx64 "\n",
+            m->tid, m->system->pid, pid, tid, sig, m->ip);
+    fflush(stderr);
+  }
   if (pid < 1 || tid < 1) return einval();
   if (pid != m->system->pid) return eperm();
 #ifdef HAVE_THREADS
@@ -5017,18 +5334,30 @@ static int SysGetppid(struct Machine *m) {
 }
 
 static int SysGetuid(struct Machine *m) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
   return getuid();
 }
 
 static int SysGetgid(struct Machine *m) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
   return getgid();
 }
 
 static int SysGeteuid(struct Machine *m) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
   return geteuid();
 }
 
 static int SysGetegid(struct Machine *m) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
   return getegid();
 }
 
@@ -5037,6 +5366,17 @@ static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
   u8 i32buf[4];
   int i, ngroups;
   long ngroups_max;
+  if (VfsHasSyntheticRootIdentity()) {
+    if (!size) {
+      return 1;
+    }
+    if (size < 1 || !IsValidMemory(m, addr, 4, PROT_WRITE)) {
+      return -1;
+    }
+    Write32(i32buf, 0);
+    CopyToUserWrite(m, addr, i32buf, 4);
+    return 1;
+  }
   if (!size) {
     return getgroups(0, 0);
   } else {
@@ -5064,6 +5404,9 @@ static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
 }
 
 static i32 SysSetgroups(struct Machine *m, i32 size, i64 addr) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
 #ifdef HAVE_SETGROUPS
   int i;
   gid_t *group;
@@ -5085,6 +5428,13 @@ static i32 SysSetresuid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
+  if (VfsHasSyntheticRootIdentity()) {
+    if ((real == (u32)-1 || real == 0) && (effective == (u32)-1 || effective == 0) &&
+        (saved == (u32)-1 || saved == 0)) {
+      return 0;
+    }
+    return eperm();
+  }
 #ifdef HAVE_SETRESUID
   return setresuid(real, effective, saved);
 #elif defined(HAVE_SETREUID)
@@ -5104,6 +5454,13 @@ static i32 SysSetresgid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
+  if (VfsHasSyntheticRootIdentity()) {
+    if ((real == (u32)-1 || real == 0) && (effective == (u32)-1 || effective == 0) &&
+        (saved == (u32)-1 || saved == 0)) {
+      return 0;
+    }
+    return eperm();
+  }
 #ifdef HAVE_SETRESGID
   return setresgid(real, effective, saved);
 #elif defined(HAVE_SETREGID)
@@ -5162,13 +5519,19 @@ static i32 SysGetresuid(struct Machine *m,  //
       (effectiveaddr && !(effective = (u8 *)SchlepW(m, effectiveaddr, 4)))) {
     return -1;
   }
+  if (VfsHasSyntheticRootIdentity()) {
+    uid = 0;
+    euid = 0;
+    suid = 0;
+  } else {
 #ifdef HAVE_SETRESUID
-  if (getresuid(&uid, &euid, &suid) == -1) return -1;
+    if (getresuid(&uid, &euid, &suid) == -1) return -1;
 #else
-  uid = getuid();
-  euid = geteuid();
-  suid = euid;
+    uid = getuid();
+    euid = geteuid();
+    suid = euid;
 #endif
+  }
   if (real) Write32(real, uid);
   if (saved) Write32(saved, suid);
   if (effective) Write32(effective, euid);
@@ -5188,13 +5551,19 @@ static i32 SysGetresgid(struct Machine *m,  //
       (effectiveaddr && !(effective = (u8 *)SchlepW(m, effectiveaddr, 4)))) {
     return -1;
   }
+  if (VfsHasSyntheticRootIdentity()) {
+    gid = 0;
+    egid = 0;
+    sgid = 0;
+  } else {
 #ifdef HAVE_SETRESUID
-  if (getresgid(&gid, &egid, &sgid) == -1) return -1;
+    if (getresgid(&gid, &egid, &sgid) == -1) return -1;
 #else
-  gid = getgid();
-  egid = getegid();
-  sgid = egid;
+    gid = getgid();
+    egid = getegid();
+    sgid = egid;
 #endif
+  }
   if (real) Write32(real, gid);
   if (saved) Write32(saved, sgid);
   if (effective) Write32(effective, egid);
@@ -5214,10 +5583,16 @@ static int SysUmask(struct Machine *m, int mask) {
 }
 
 static int SysSetuid(struct Machine *m, int uid) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return uid == 0 ? 0 : eperm();
+  }
   return setuid(uid);
 }
 
 static int SysSetgid(struct Machine *m, int gid) {
+  if (VfsHasSyntheticRootIdentity()) {
+    return gid == 0 ? 0 : eperm();
+  }
   return setgid(gid);
 }
 
@@ -5298,15 +5673,40 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
   return SysPipe2(m, pipefds_addr, 0);
 }
 
-#ifdef HAVE_EPOLL_PWAIT1
+static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
+  int fildes;
+  int lim;
+  int oflags;
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  oflags = O_RDWR;
+  if (flags & EFD_CLOEXEC_LINUX) {
+    oflags |= O_CLOEXEC;
+  }
+  if (flags & EFD_NONBLOCK_LINUX) {
+    oflags |= O_NDELAY;
+  }
+  if ((fildes = BlinkEventfdCreate(initval, flags)) == -1) {
+    return -1;
+  }
+  if (fildes >= lim) {
+    VfsClose(fildes);
+    return emfile();
+  }
+  LOCK(&m->system->fds.lock);
+  unassert(AddFd(&m->system->fds, fildes, oflags));
+  UNLOCK(&m->system->fds.lock);
+  return fildes;
+}
+
+static i32 SysEventfd(struct Machine *m, u32 initval) {
+  return SysEventfd2(m, initval, 0);
+}
 
 static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
-  int lim, fildes, oflags, sysflags;
+  int lim, fildes, oflags;
   oflags = 0;
-  sysflags = 0;
   if (flags & EPOLL_CLOEXEC_LINUX) {
     oflags |= O_CLOEXEC;
-    sysflags |= EPOLL_CLOEXEC;
     flags &= ~EPOLL_CLOEXEC_LINUX;
   }
   if (flags) {
@@ -5314,16 +5714,16 @@ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
     return einval();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
-  if ((fildes = epoll_create1(sysflags)) != -1) {
-    if (fildes >= lim) {
-      close(fildes);
-      fildes = emfile();
-    } else {
-      LOCK(&m->system->fds.lock);
-      unassert(AddFd(&m->system->fds, fildes, oflags));
-      UNLOCK(&m->system->fds.lock);
-    }
+  if ((fildes = BlinkEpollCreate(flags)) == -1) {
+    return -1;
   }
+  if (fildes >= lim) {
+    VfsClose(fildes);
+    return emfile();
+  }
+  LOCK(&m->system->fds.lock);
+  unassert(AddFd(&m->system->fds, fildes, O_RDONLY | oflags));
+  UNLOCK(&m->system->fds.lock);
   return fildes;
 }
 
@@ -5334,11 +5734,11 @@ static i32 SysEpollCreate(struct Machine *m, i32 size) {
 
 static i32 SysEpollCtl(struct Machine *m, i32 epfd, i32 op, i32 fd,
                        i64 eventaddr) {
-  struct epoll_event epe, *pepe;
   const struct epoll_event_linux *gepe;
+  u32 events = 0;
+  u64 data = 0;
   switch (op) {
     case EPOLL_CTL_DEL_LINUX:
-      pepe = 0;
       break;
     case EPOLL_CTL_ADD_LINUX:
     case EPOLL_CTL_MOD_LINUX:
@@ -5346,24 +5746,21 @@ static i32 SysEpollCtl(struct Machine *m, i32 epfd, i32 op, i32 fd,
                                                              sizeof(*gepe)))) {
         return -1;
       }
-      epe.events = Read32(gepe->events);
-      epe.data.u64 = Read64(gepe->data);
-      pepe = &epe;
+      events = Read32(gepe->events);
+      data = Read64(gepe->data);
       break;
     default:
       return einval();
   }
-  return epoll_ctl(epfd, op, fd, pepe);
+  return BlinkEpollCtl(epfd, op, fd, events, data);
 }
 
 static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
                       i32 maxevents, struct timespec deadline, i64 sigmaskaddr,
                       u64 sigsetsize) {
-  i32 i, rc;
+  i32 rc;
   u64 oldmask_guest = 0;
   sigset_t block, oldmask;
-  struct epoll_event *events;
-  struct timespec now, waitfor;
   struct epoll_event_linux *gevents;
   const struct sigset_linux *sigmaskp_guest = 0;
   if (maxevents <= 0) return einval();
@@ -5377,8 +5774,6 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
   if (!IsValidMemory(m, eventsaddr,
                      maxevents * sizeof(struct epoll_event_linux),
                      PROT_WRITE) ||
-      !(events = (struct epoll_event *)AddToFreeList(
-            m, calloc(maxevents, sizeof(struct epoll_event)))) ||
       !(gevents = (struct epoll_event_linux *)AddToFreeList(
             m, calloc(maxevents, sizeof(struct epoll_event_linux))))) {
     return -1;
@@ -5390,41 +5785,13 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
     m->sigmask = Read64(sigmaskp_guest->sigmask);
     SIG_LOGF("sigmask push %" PRIx64, m->sigmask);
   }
-  if (!CheckInterrupt(m, false)) {
-    do {
-      now = GetTime();
-      if (CompareTime(now, deadline) < 0) {
-        waitfor = SubtractTime(deadline, now);
-      } else {
-        waitfor = GetZeroTime();
-      }
-#if defined(HAVE_EPOLL_PWAIT2) && !defined(MUSL_CROSS_MAKE)
-      rc = epoll_pwait2(epfd, events, maxevents, &waitfor, &oldmask);
-#else
-      rc = epoll_pwait(epfd, events, maxevents,
-                       ConvertTimeToInt(ToMilliseconds(waitfor)), &oldmask);
-#endif
-      if (rc == -1 && errno == EINTR) {
-        if (CheckInterrupt(m, false)) {
-          break;
-        }
-      } else {
-        break;
-      }
-    } while (1);
-  } else {
-    rc = -1;
-  }
+  rc = BlinkEpollWait(m, epfd, gevents, maxevents, deadline);
   if (sigmaskp_guest) {
     m->sigmask = oldmask_guest;
     SIG_LOGF("sigmask pop %" PRIx64, m->sigmask);
   }
   unassert(!pthread_sigmask(SIG_SETMASK, &oldmask, 0));
   if (rc != -1) {
-    for (i = 0; i < rc; ++i) {
-      Write32(gevents[i].events, events[i].events);
-      Write64(gevents[i].data, events[i].data.u64);
-    }
     unassert(!CopyToUserWrite(m, eventsaddr, gevents,
                               rc * sizeof(struct epoll_event_linux)));
   }
@@ -5442,6 +5809,51 @@ static i32 SysEpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
   }
   return EpollPwait(m, epfd, eventsaddr, maxevents, deadline, sigmaskaddr,
                     sigsetsize);
+}
+
+#define MEMBARRIER_CMD_QUERY_LINUX                               0
+#define MEMBARRIER_CMD_GLOBAL_LINUX                              (1 << 0)
+#define MEMBARRIER_CMD_GLOBAL_EXPEDITED_LINUX                    (1 << 1)
+#define MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED_LINUX           (1 << 2)
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED_LINUX                   (1 << 3)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_LINUX          (1 << 4)
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE_LINUX         (1 << 5)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE_LINUX (1 << 6)
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ_LINUX              (1 << 7)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ_LINUX     (1 << 8)
+
+static int SysMembarrier(struct Machine *m, int cmd, unsigned int flags,
+                         int cpu_id) {
+  const int supported =
+      MEMBARRIER_CMD_PRIVATE_EXPEDITED_LINUX |
+      MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_LINUX |
+      MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE_LINUX |
+      MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE_LINUX |
+      MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ_LINUX |
+      MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ_LINUX;
+
+  (void)cpu_id;
+  if (flags != 0) {
+    return einval();
+  }
+
+  switch (cmd) {
+    case MEMBARRIER_CMD_QUERY_LINUX:
+      return supported;
+    case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_LINUX:
+    case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE_LINUX:
+    case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ_LINUX:
+      return 0;
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED_LINUX:
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE_LINUX:
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ_LINUX:
+      atomic_thread_fence(memory_order_seq_cst);
+      InvalidateSystem(m->system, false, true);
+      atomic_thread_fence(memory_order_seq_cst);
+      return 0;
+    default:
+      return einval();
+  }
 }
 
 static i32 SysEpollPwait2(struct Machine *m, i32 epfd, i64 eventsaddr,
@@ -5462,8 +5874,6 @@ static int SysEpollWait(struct Machine *m, i32 epfd, i64 eventsaddr,
                         i32 maxevents, i32 timeout) {
   return SysEpollPwait(m, epfd, eventsaddr, maxevents, timeout, 0, 8);
 }
-
-#endif /* HAVE_EPOLL_PWAIT1 */
 
 void OpSyscall(P) {
   size_t mark;
@@ -5705,17 +6115,18 @@ void OpSyscall(P) {
     SYSCALL(5, 0x10F, "ppoll", SysPpoll, STRACE_5);
     SYSCALL(5, 0x13C, "renameat2", SysRenameat2, STRACE_RENAMEAT2);
     SYSCALL(3, 0x13E, "getrandom", SysGetrandom, STRACE_GETRANDOM);
+    SYSCALL(3, 0x144, "membarrier", SysMembarrier, STRACE_3);
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
-#ifdef HAVE_EPOLL_PWAIT1
+    SYSCALL(1, 0x11C, "eventfd", SysEventfd, STRACE_1);
+    SYSCALL(2, 0x122, "eventfd2", SysEventfd2, STRACE_2);
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
     SYSCALL(4, 0x0E9, "epoll_ctl", SysEpollCtl, STRACE_4);
     SYSCALL(4, 0x0E8, "epoll_wait", SysEpollWait, STRACE_4);
     SYSCALL(6, 0x119, "epoll_pwait", SysEpollPwait, STRACE_6);
     SYSCALL(6, 0x1B9, "epoll_pwait2", SysEpollPwait2, STRACE_6);
-#endif /* HAVE_EPOLL_PWAIT1 */
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
@@ -5742,6 +6153,10 @@ void OpSyscall(P) {
       break;
     default:
     DefaultCase:
+      if (getenv("OMNIKIT_BLINK_VM_TRACE") != NULL) {
+        fprintf(stderr, "[vmtrace:missing-syscall] nr=%#" PRIx64 "\n", ax);
+        fflush(stderr);
+      }
       LOGF("missing syscall 0x%03" PRIx64, ax);
       ax = enosys();
       break;

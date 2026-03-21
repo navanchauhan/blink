@@ -53,6 +53,7 @@
 #define kMachineSimdException        -9
 #define kMachineExitTrap             -10
 #define kMachineFatalSystemSignal    -11
+#define kMachineExecTrap             -12
 
 #define CR0_PE 0x01        // protected mode enabled
 #define CR0_MP 0x02        // monitor coprocessor
@@ -279,6 +280,7 @@ struct System {
   bool loaded;
   bool iscosmo;
   bool trapexit;
+  bool embedded_exit_fastpath;
   bool brkchanged;
   _Atomic(bool) killer;
   u16 gdt_limit;
@@ -533,6 +535,7 @@ u8 *BeginStoreNp(struct Machine *, i64, size_t, void *[2], u8 *);
 int GetFileDescriptorLimit(struct System *);
 bool HasPageLock(const struct Machine *, i64) nosideeffect;
 void CollectPageLocks(struct Machine *);
+void FlushPageLocks(struct Machine *);
 u8 *LookupAddress(struct Machine *, i64);
 u8 *LookupAddress2(struct Machine *, i64, u64, u64);
 u8 *SpyAddress(struct Machine *, i64);

@@ -661,19 +661,21 @@ static char **ConcatStrLists(struct Machine *m, char **a, char **b) {
 static int CanEmulateData(struct Machine *m, char **prog, char ***argv,
                           bool isfirst, char *img, size_t imglen) {
   char **newargv;
+  char **prefix_argv;
   char *interp[3] = {0};
   if (IsSupportedExecutable(*prog, img, imglen)) {
     return 1;
-  } else if (isfirst && HasShebang(m, img, imglen, interp, interp + 1) &&
-             CanEmulateImpl(m, interp, 0, false) &&
-             (newargv = ConcatStrLists(m, interp, *argv))) {
-    newargv[1 + !!interp[1]] = *prog;
-    *prog = interp[0];
-    *argv = newargv;
-    return 2;
-  } else {
-    return 0;
+  } else if (isfirst && HasShebang(m, img, imglen, interp, interp + 1)) {
+    prefix_argv = interp;
+    if (CanEmulateImpl(m, interp, 0, false) &&
+        (newargv = ConcatStrLists(m, prefix_argv, *argv))) {
+      newargv[CountStrList(prefix_argv)] = *prog;
+      *prog = interp[0];
+      *argv = newargv;
+      return 2;
+    }
   }
+  return 0;
 }
 
 static bool IsApeBinary(const char *path) {

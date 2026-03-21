@@ -129,6 +129,10 @@ void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
 }
 
 static void FreePageTable(struct System *s, u8 *page) {
+  // Cached anonymous pages must be zero-filled when they are reused. Data pages
+  // are scrubbed in FreePage(), but empty page-table pages can reach the same
+  // allocator path too, so clear them before caching.
+  ClearPage(page);
   FreeAnonymousPage(s, page);
   s->memstat.tables -= 1;
   s->rss -= 1;
@@ -303,6 +307,7 @@ bool IsOrphan(struct Machine *m) {
 void KillOtherThreads(struct System *s) {
 #ifdef HAVE_THREADS
   int r, t;
+  int tries_before_force;
   struct Dll *e;
   struct Machine *m;
   struct timespec deadline;
@@ -310,6 +315,10 @@ void KillOtherThreads(struct System *s) {
     FreeMachine(g_machine);
     pthread_exit(EXIT_SUCCESS);
   }
+  // Embedded nofork runs stay in-process after guest exit, so giving helper
+  // threads a longer grace period avoids spurious SIGKILL-style exits for
+  // workloads like Node/Codex that need a bit more time to unwind.
+  tries_before_force = (s->trapexit && !s->embedded_exit_fastpath) ? 80 : 10;
 StartOver:
   unassert(s == g_machine->system);
   unassert(!dll_is_empty(s->machines));
@@ -321,10 +330,16 @@ StartOver:
                  m->tid);
         atomic_store_explicit(&m->killed, true, memory_order_release);
         atomic_store_explicit(&m->attention, true, memory_order_release);
-        if (t < 10) {
+        if (t < tries_before_force) {
           pthread_kill(m->thread, SIGSYS);
+        } else if (s->embedded_exit_fastpath) {
+          LOGF("detaching thread after %d tries during embedded exit",
+               tries_before_force);
+          dll_remove(&s->machines, e);
+          UNLOCK(&s->machines_lock);
+          goto StartOver;
         } else {
-          LOGF("kill9'd thread after 10 tries");
+          LOGF("kill9'd thread after %d tries", tries_before_force);
           pthread_kill(m->thread, SIGKILL);
           dll_remove(&s->machines, e);
           UNLOCK(&s->machines_lock);

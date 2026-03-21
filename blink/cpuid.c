@@ -19,6 +19,7 @@
 #include "blink/assert.h"
 #include "blink/endian.h"
 #include "blink/machine.h"
+#include <stdlib.h>
 
 #define INTEL    "GenuineIntel"
 #define BLINK    "GenuineBlink"
@@ -95,7 +96,13 @@
 #endif
 
 void OpCpuid(P) {
+  static int conservative_mode = -1;
+  bool conservative;
   u32 ax, bx, cx, dx, jit;
+  if (conservative_mode == -1) {
+    conservative_mode = getenv("OMNIKIT_BLINK_CONSERVATIVE_CPUID") != NULL;
+  }
+  conservative = conservative_mode;
   if (m->trapcpuid) {
     ThrowSegmentationFault(m, 0);
   }
@@ -129,11 +136,6 @@ void OpCpuid(P) {
       dx = Read32((const u8 *)ARCH_NAME + 8);
       break;
     case 1:
-      cx |= 1 << 0;    // sse3
-      cx |= 1 << 1;    // pclmulqdq
-      cx |= 1 << 9;    // ssse3
-      cx |= 1 << 23;   // popcnt
-      cx |= 1 << 30;   // rdrnd
       cx |= 0 << 25;   // aes
       cx |= 1 << 13;   // cmpxchg16b
       cx |= 1u << 31;  // hypervisor
@@ -148,6 +150,13 @@ void OpCpuid(P) {
       dx |= 1 << 26;   // sse2
       cx |= 0 << 19;   // sse4.1
       cx |= 0 << 20;   // sse4.2
+      if (!conservative) {
+        cx |= 1 << 0;   // sse3
+        cx |= 1 << 1;   // pclmulqdq
+        cx |= 1 << 9;   // ssse3
+        cx |= 1 << 23;  // popcnt
+        cx |= 1 << 30;  // rdrnd
+      }
 #ifndef DISABLE_X87
       dx |= 1 << 0;  // fpu
 #endif
@@ -161,14 +170,16 @@ void OpCpuid(P) {
     case 7:
       switch (Get32(m->cx)) {
         case 0:
-          bx |= 1 << 0;   // fsgsbase
-          bx |= 1 << 9;   // erms
-          bx |= 1 << 18;  // rdseed
-          cx |= 1 << 22;  // rdpid
+          bx |= 1 << 9;  // erms
+          if (!conservative) {
+            bx |= 1 << 0;   // fsgsbase
+            bx |= 1 << 18;  // rdseed
+            cx |= 1 << 22;  // rdpid
 #ifndef DISABLE_BMI2
-          bx |= 1 << 8;   // bmi2
-          bx |= 1 << 19;  // adx
+            bx |= 1 << 8;   // bmi2
+            bx |= 1 << 19;  // adx
 #endif
+          }
           break;
         default:
           break;

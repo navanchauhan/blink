@@ -155,6 +155,11 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   DisableJit(&m->system->jit);  // unmapping exec pages is slow
 #endif
   if (IsSignalSerious(sig)) {
+    fprintf(stderr,
+            "[terminate] sig=%d rip=%#" PRIx64 " code=%d faultaddr=%#" PRIx64
+            "\n",
+            sig, m->ip, code, m->faultaddr);
+    fflush(stderr);
     ERRF("terminating due to %s ("
          "rip=%#" PRIx64 " "
          "code=%d "

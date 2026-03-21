@@ -16,6 +16,8 @@
 │ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR             │
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "blink/builtin.h"
@@ -31,6 +33,26 @@
 
 static const u8 kStackOsz[2][3] = {{4, 4, 8}, {2, 2, 2}};
 static const u8 kCallOsz[2][3] = {{4, 4, 8}, {2, 2, 8}};
+
+static bool ShouldTraceBranchTarget(u64 target) {
+  static bool initialized;
+  static bool enabled;
+  static u64 start;
+  static u64 end;
+  const char *begin_env;
+  const char *end_env;
+  if (!initialized) {
+    initialized = true;
+    begin_env = getenv("OMNIKIT_BLINK_BRANCH_TARGET_START");
+    end_env = getenv("OMNIKIT_BLINK_BRANCH_TARGET_END");
+    if (begin_env && *begin_env && end_env && *end_env) {
+      start = strtoull(begin_env, 0, 0);
+      end = strtoull(end_env, 0, 0);
+      enabled = true;
+    }
+  }
+  return enabled && target >= start && target < end;
+}
 
 static void WriteStackWord(u8 *p, u64 rde, u32 osz, u64 x) {
   IGNORE_RACES_START();
@@ -83,6 +105,7 @@ static u64 ReadMemWord(u8 *p, u32 osz) {
 static void PushN(P, u64 x, unsigned mode, unsigned osz) {
   u8 *w;
   u64 v;
+  u64 entry;
   u8 b[8];
   void *p[2];
   switch (mode) {
@@ -102,6 +125,17 @@ static void PushN(P, u64 x, unsigned mode, unsigned osz) {
       break;
     default:
       __builtin_unreachable();
+  }
+  if (getenv("OMNIKIT_BLINK_BRANCH_TRACE") != NULL && x && (x & 1) &&
+      v == Get64(m->r15)) {
+    entry = FindPageTableEntry(m, x & -4096);
+    if (!(entry & PAGE_V) || (entry & PAGE_XD)) {
+      fprintf(stderr,
+              "[branch-trace:push] src=%#" PRIx64 " dst_slot=%#" PRIx64
+              " value=%#" PRIx64 " pte=%#" PRIx64 "\n",
+              m->ip - Oplength(rde), v, x, entry);
+      fflush(stderr);
+    }
   }
   w = AccessRam(m, v, osz, p, b, false);
   WriteStackWord(w, rde, osz, x);
@@ -155,8 +189,38 @@ u64 Pop(P, u16 extra) {
 void OpPopZvq(P) {
   u64 x;
   int osz;
+  u64 source;
+  u64 old_sp;
   osz = kStackOsz[Osz(rde)][Mode(rde)];
+  source = m->ip - Oplength(rde);
+  old_sp = Get64(m->sp);
   x = PopN(A, 0, osz);
+  if (getenv("OMNIKIT_BLINK_BRANCH_TRACE") != NULL && x && (x & 1)) {
+    u64 entry = FindPageTableEntry(m, x & -4096);
+    if (!(entry & PAGE_V) || (entry & PAGE_XD)) {
+      u8 *src = SpyAddress(m, source - 8);
+      u8 *stk = SpyAddress(m, old_sp);
+      fprintf(stderr,
+              "[branch-trace:pop] src=%#" PRIx64 " slot=%#" PRIx64
+              " value=%#" PRIx64 " pte=%#" PRIx64 " reg=%d\n",
+              source, old_sp, x, entry, RexbSrm(rde));
+      if (src) {
+        fprintf(stderr,
+                "[branch-trace:pop] src_window=%02x %02x %02x %02x %02x %02x"
+                " %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6],
+                src[7], src[8], src[9], src[10], src[11], src[12], src[13],
+                src[14], src[15]);
+      }
+      if (stk) {
+        fprintf(stderr,
+                "[branch-trace:pop] stack_qwords=%#" PRIx64 " %#" PRIx64
+                " %#" PRIx64 "\n",
+                Read64(stk + 0), Read64(stk + 8), Read64(stk + 16));
+      }
+      fflush(stderr);
+    }
+  }
   switch (osz) {
     case 8:
     case 4:
@@ -177,6 +241,17 @@ void OpPopZvq(P) {
 }
 
 static void OpCall(P, u64 func) {
+  if (getenv("OMNIKIT_BLINK_BRANCH_TRACE") != NULL ||
+      ShouldTraceBranchTarget(func)) {
+    u64 entry = FindPageTableEntry(m, func & -4096);
+    if (ShouldTraceBranchTarget(func) || !(entry & PAGE_V) || (entry & PAGE_XD)) {
+      fprintf(stderr,
+              "[branch-trace:call] src=%#" PRIx64 " dst=%#" PRIx64
+              " pte=%#" PRIx64 "\n",
+              m->ip - Oplength(rde), func, entry);
+      fflush(stderr);
+    }
+  }
   PushN(A, m->ip, Mode(rde), kCallOsz[Osz(rde)][Mode(rde)]);
   m->ip = func;
 }
@@ -214,7 +289,21 @@ void OpJmpEq(P) {
            "m",     // call micro-op (FastJmpAbs)
            FastJmpAbs);
   }
-  m->ip = LoadAddressFromMemory(A);
+  {
+    u64 func = LoadAddressFromMemory(A);
+    if (getenv("OMNIKIT_BLINK_BRANCH_TRACE") != NULL ||
+        ShouldTraceBranchTarget(func)) {
+      u64 entry = FindPageTableEntry(m, func & -4096);
+      if (ShouldTraceBranchTarget(func) || !(entry & PAGE_V) || (entry & PAGE_XD)) {
+        fprintf(stderr,
+                "[branch-trace:jmp] src=%#" PRIx64 " dst=%#" PRIx64
+                " pte=%#" PRIx64 "\n",
+                m->ip - Oplength(rde), func, entry);
+        fflush(stderr);
+      }
+    }
+    m->ip = func;
+  }
 }
 
 void OpEnter(P) {
@@ -265,7 +354,38 @@ void OpLeave(P) {
 }
 
 void OpRet(P) {
+  u64 source = m->ip - Oplength(rde);
+  u64 old_sp = Get64(m->sp);
   m->ip = Pop(A, 0);
+  if (getenv("OMNIKIT_BLINK_BRANCH_TRACE") != NULL ||
+      ShouldTraceBranchTarget(m->ip)) {
+    u64 entry = FindPageTableEntry(m, m->ip & -4096);
+    if (ShouldTraceBranchTarget(m->ip) || !(entry & PAGE_V) ||
+        (entry & PAGE_XD)) {
+      u8 *src = SpyAddress(m, source - 8);
+      u8 *stk = SpyAddress(m, old_sp);
+      fprintf(stderr,
+              "[branch-trace:ret] src=%#" PRIx64 " dst=%#" PRIx64
+              " pte=%#" PRIx64 " sp_before=%#" PRIx64 " sp_after=%#" PRIx64
+              "\n",
+              source, m->ip, entry, old_sp, Get64(m->sp));
+      if (src) {
+        fprintf(stderr,
+                "[branch-trace:ret] src_window=%02x %02x %02x %02x %02x %02x"
+                " %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6],
+                src[7], src[8], src[9], src[10], src[11], src[12], src[13],
+                src[14], src[15]);
+      }
+      if (stk) {
+        fprintf(stderr,
+                "[branch-trace:ret] stack_qwords=%#" PRIx64 " %#" PRIx64
+                " %#" PRIx64 "\n",
+                Read64(stk + 0), Read64(stk + 8), Read64(stk + 16));
+      }
+      fflush(stderr);
+    }
+  }
   if (IsMakingPath(m) && HasLinearMapping() && !Osz(rde)) {
 #ifdef __x86_64__
     Jitter(A,
@@ -297,7 +417,38 @@ void OpRet(P) {
 }
 
 relegated void OpRetIw(P) {
+  u64 source = m->ip - Oplength(rde);
+  u64 old_sp = Get64(m->sp);
   m->ip = Pop(A, uimm0);
+  if (getenv("OMNIKIT_BLINK_BRANCH_TRACE") != NULL ||
+      ShouldTraceBranchTarget(m->ip)) {
+    u64 entry = FindPageTableEntry(m, m->ip & -4096);
+    if (ShouldTraceBranchTarget(m->ip) || !(entry & PAGE_V) ||
+        (entry & PAGE_XD)) {
+      u8 *src = SpyAddress(m, source - 8);
+      u8 *stk = SpyAddress(m, old_sp);
+      fprintf(stderr,
+              "[branch-trace:ret-imm] src=%#" PRIx64 " dst=%#" PRIx64
+              " pte=%#" PRIx64 " sp_before=%#" PRIx64 " sp_after=%#" PRIx64
+              "\n",
+              source, m->ip, entry, old_sp, Get64(m->sp));
+      if (src) {
+        fprintf(stderr,
+                "[branch-trace:ret-imm] src_window=%02x %02x %02x %02x %02x"
+                " %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6],
+                src[7], src[8], src[9], src[10], src[11], src[12], src[13],
+                src[14], src[15]);
+      }
+      if (stk) {
+        fprintf(stderr,
+                "[branch-trace:ret-imm] stack_qwords=%#" PRIx64 " %#" PRIx64
+                " %#" PRIx64 "\n",
+                Read64(stk + 0), Read64(stk + 8), Read64(stk + 16));
+      }
+      fflush(stderr);
+    }
+  }
 }
 
 void OpPushEvq(P) {
@@ -307,5 +458,7 @@ void OpPushEvq(P) {
 
 void OpPopEvq(P) {
   unsigned osz = kStackOsz[Osz(rde)][Mode(rde)];
-  WriteMemWord(GetModrmRegisterWordPointerWrite(A, osz), rde, osz, Pop(A, 0));
+  u64 x = Pop(A, 0);
+  /* POP computes its memory destination after incrementing SP. */
+  WriteMemWord(GetModrmRegisterWordPointerWrite(A, osz), rde, osz, x);
 }

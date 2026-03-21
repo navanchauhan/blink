@@ -59,6 +59,128 @@
 _Thread_local siginfo_t g_siginfo;
 _Thread_local struct Machine *g_machine;
 
+static void TraceWatchedGuestAddress(struct Machine *m, u64 source) {
+  static bool initialized;
+  static bool enabled;
+  static bool have_value;
+  static u64 watch_addr;
+  static u64 old_value;
+  u8 *p;
+  u8 *src;
+  u64 value;
+  const char *env;
+  if (!initialized) {
+    initialized = true;
+    if ((env = getenv("OMNIKIT_BLINK_WATCH_ADDR")) && *env) {
+      watch_addr = strtoull(env, 0, 0);
+      enabled = true;
+    }
+  }
+  if (!enabled) return;
+  if (!(p = SpyAddress(m, watch_addr))) {
+    have_value = false;
+    return;
+  }
+  value = Read64(p);
+  if (!have_value) {
+    old_value = value;
+    have_value = true;
+    return;
+  }
+  if (value == old_value) return;
+  src = SpyAddress(m, source - 8);
+  fprintf(stderr,
+          "[watch-addr] src=%#" PRIx64 " addr=%#" PRIx64 " old=%#" PRIx64
+          " new=%#" PRIx64 " rsp=%#" PRIx64 " r15=%#" PRIx64 "\n",
+          source, watch_addr, old_value, value, Get64(m->sp), Get64(m->r15));
+  if (src) {
+    fprintf(stderr,
+            "[watch-addr] src_window=%02x %02x %02x %02x %02x %02x %02x %02x"
+            " | %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+            src[8], src[9], src[10], src[11], src[12], src[13], src[14],
+            src[15]);
+  }
+  fflush(stderr);
+  old_value = value;
+}
+
+static void TracePcRangeBefore(struct Machine *m, u64 source) {
+  static bool initialized;
+  static bool enabled;
+  static u64 start;
+  static u64 end;
+  const char *begin_env;
+  const char *end_env;
+  if (!initialized) {
+    initialized = true;
+    begin_env = getenv("OMNIKIT_BLINK_PC_TRACE_START");
+    end_env = getenv("OMNIKIT_BLINK_PC_TRACE_END");
+    if (begin_env && *begin_env && end_env && *end_env) {
+      start = strtoull(begin_env, 0, 0);
+      end = strtoull(end_env, 0, 0);
+      enabled = true;
+    }
+  }
+  if (!enabled) return;
+  if (source < start || source >= end) return;
+  fprintf(stderr,
+          "[pc-trace:before] pc=%#" PRIx64 " rsp=%#" PRIx64 " rbp=%#" PRIx64
+          " r15=%#" PRIx64 " rax=%#" PRIx64 " rcx=%#" PRIx64 " rdx=%#" PRIx64
+          " op=%s\n",
+          source, Get64(m->sp), Get64(m->bp), Get64(m->r15), Get64(m->ax),
+          Get64(m->cx), Get64(m->dx), DescribeOp(m, source));
+  fflush(stderr);
+}
+
+static void TracePcRangeAfter(struct Machine *m, u64 source) {
+  static bool initialized;
+  static bool enabled;
+  static u64 start;
+  static u64 end;
+  const char *begin_env;
+  const char *end_env;
+  if (!initialized) {
+    initialized = true;
+    begin_env = getenv("OMNIKIT_BLINK_PC_TRACE_START");
+    end_env = getenv("OMNIKIT_BLINK_PC_TRACE_END");
+    if (begin_env && *begin_env && end_env && *end_env) {
+      start = strtoull(begin_env, 0, 0);
+      end = strtoull(end_env, 0, 0);
+      enabled = true;
+    }
+  }
+  if (!enabled) return;
+  if (source < start || source >= end) return;
+  fprintf(stderr,
+          "[pc-trace:after]  pc=%#" PRIx64 " rsp=%#" PRIx64 " rbp=%#" PRIx64
+          " r15=%#" PRIx64 " rax=%#" PRIx64 " rcx=%#" PRIx64 " rdx=%#" PRIx64
+          "\n",
+          source, Get64(m->sp), Get64(m->bp), Get64(m->r15), Get64(m->ax),
+          Get64(m->cx), Get64(m->dx));
+  fflush(stderr);
+}
+
+static bool ShouldTraceBranchTargetInMachine(u64 target) {
+  static bool initialized;
+  static bool enabled;
+  static u64 start;
+  static u64 end;
+  const char *begin_env;
+  const char *end_env;
+  if (!initialized) {
+    initialized = true;
+    begin_env = getenv("OMNIKIT_BLINK_BRANCH_TARGET_START");
+    end_env = getenv("OMNIKIT_BLINK_BRANCH_TARGET_END");
+    if (begin_env && *begin_env && end_env && *end_env) {
+      start = strtoull(begin_env, 0, 0);
+      end = strtoull(end_env, 0, 0);
+      enabled = true;
+    }
+  }
+  return enabled && target >= start && target < end;
+}
+
 static void OpHintNopEv(P) {
 }
 
@@ -906,6 +1028,14 @@ void Terminate(P, void uop(struct Machine *, u64)) {
 }
 
 static void OpJmp(P) {
+  if (ShouldTraceBranchTargetInMachine(m->ip + disp)) {
+    fprintf(stderr,
+            "[branch-trace:jmp-direct] src=%#" PRIx64 " dst=%#" PRIx64
+            " rsp=%#" PRIx64 " rbp=%#" PRIx64 " r15=%#" PRIx64 "\n",
+            m->ip - Oplength(rde), m->ip + disp, Get64(m->sp), Get64(m->bp),
+            Get64(m->r15));
+    fflush(stderr);
+  }
   m->ip += disp;
   Terminate(A, FastJmp);
 }
@@ -2091,21 +2221,41 @@ nexgen32e_f GetOp(long op) {
 }
 
 static bool CanJit(struct Machine *m) {
-  return !IsJitDisabled(&m->system->jit);
+  static int allow_anon_exec_jit = -1;
+  u64 entry;
+  if (IsJitDisabled(&m->system->jit)) {
+    return false;
+  }
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+  if (allow_anon_exec_jit == -1) {
+    allow_anon_exec_jit = getenv("OMNIKIT_BLINK_ALLOW_ANON_EXEC_JIT") != NULL;
+  }
+  if (!allow_anon_exec_jit &&
+      (entry = FindPageTableEntry(m, m->ip & -4096)) &&
+      (entry & PAGE_V) && !(entry & PAGE_XD) && !(entry & PAGE_FILE)) {
+    return false;
+  }
+#endif
+  return true;
 }
 
 void JitlessDispatch(P) {
+  u64 source;
   ASM_LOGF("decoding [%s] at address %" PRIx64, DescribeOp(m, GetPc(m)),
            GetPc(m));
   COSTLY_STATISTIC(++instructions_dispatched);
+  source = GetPc(m);
   LoadInstruction(m, GetPc(m));
   rde = m->xedd->op.rde;
   disp = m->xedd->op.disp;
   uimm0 = m->xedd->op.uimm0;
+  TracePcRangeBefore(m, source);
   m->oplen = Oplength(rde);
   m->ip += Oplength(rde);
   GetOp(Mopcode(rde))(A);
   if (m->stashaddr) CommitStash(m);
+  TracePcRangeAfter(m, source);
+  TraceWatchedGuestAddress(m, source);
   m->oplen = 0;
 }
 
@@ -2277,5 +2427,10 @@ void HandleFatalSystemSignal(struct Machine *m, const siginfo_t *si) {
   RestoreIp(m);
   m->faultaddr = ConvertHostToGuestAddress(m->system, si->si_addr, 0);
   sig = UnXlatSignal(si->si_signo);
+  fprintf(stderr,
+          "[fatal-signal] host_sig=%d host_code=%d rip=%#" PRIx64
+          " si_addr=%p guest_fault=%#" PRIx64 "\n",
+          si->si_signo, si->si_code, m->ip, si->si_addr, m->faultaddr);
+  fflush(stderr);
   DeliverSignalToUser(m, sig, UnXlatSiCode(sig, si->si_code));
 }

@@ -278,6 +278,7 @@ int VfsMsync(void *, size_t, int);
 
 int VfsInitRootMount(const char *, const char *, u64, const void *, bool, bool,
                      const char *);
+bool VfsHasSyntheticRootIdentity(void);
 void VfsResetForReuse(void);
 void VfsCloseAll(void);
 int VfsInit(const char *);

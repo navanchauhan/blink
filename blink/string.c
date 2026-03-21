@@ -19,6 +19,7 @@
 #include "blink/string.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "blink/alu.h"
@@ -153,8 +154,23 @@ static void StringOp(P, int op) {
                (Rep(rde) == 3 && !GetFlag(m->flags, FLAGS_ZF));
         break;
       case STRING_MOVS:
-        memmove(BeginStore(m, (v = AddressDi(A)), n, p, s[0]),
-                Load(m, AddressSi(A), n, s[1]), n);
+        {
+          u8 *dst;
+          u8 *src;
+          i64 si;
+          v = AddressDi(A);
+          si = AddressSi(A);
+          dst = BeginStore(m, v, n, p, s[0]);
+          src = Load(m, si, n, s[1]);
+          if ((uintptr_t)dst < 0x100000000ull || (uintptr_t)src < 0x100000000ull) {
+            fprintf(stderr,
+                    "[movs] rip=%#" PRIx64 " di=%#" PRIx64 " si=%#" PRIx64
+                    " dst=%p src=%p n=%u rep=%d\n",
+                    m->ip, (u64)v, (u64)si, dst, src, n, Rep(rde));
+            fflush(stderr);
+          }
+          memmove(dst, src, n);
+        }
         AddDi(A, sgn * n);
         AddSi(A, sgn * n);
         EndStore(m, v, n, p, s[0]);

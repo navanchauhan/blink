@@ -40,6 +40,12 @@ void RestoreIp(struct Machine *m) {
 }
 
 void DeliverSignalToUser(struct Machine *m, int sig, int code) {
+  if (sig == SIGSEGV_LINUX) {
+    fprintf(stderr,
+            "[deliver-segv] rip=%#" PRIx64 " faultaddr=%#" PRIx64 " code=%d\n",
+            m ? m->ip : 0, m ? m->faultaddr : 0, code);
+    fflush(stderr);
+  }
   if (m->sigmask & ((u64)1 << (sig - 1))) {
     TerminateSignal(m, sig, code);
   }
@@ -101,6 +107,7 @@ void HaltMachine(struct Machine *m, int code) {
       DeliverSignalToUser(m, SIGSEGV_LINUX, SI_KERNEL_LINUX);
       break;
     case kMachineExitTrap:
+    case kMachineExecTrap:
       RestoreIp(m);
       break;
     default:
@@ -127,6 +134,9 @@ void ThrowProtectionFault(struct Machine *m) {
 }
 
 void ThrowSegmentationFault(struct Machine *m, i64 va) {
+  fprintf(stderr, "[throw-segv] rip=%#" PRIx64 " va=%#" PRIx64 " code=%d\n",
+          m ? m->ip : 0, va, m ? m->segvcode : 0);
+  fflush(stderr);
   RestoreIp(m);
   m->faultaddr = va;
   HaltMachine(m, kMachineSegmentationFault);

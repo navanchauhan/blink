@@ -709,6 +709,9 @@ int HostfsChown(struct VfsInfo *parent, const char *name, uid_t uid, gid_t gid,
   int hostfd;
   char hostname[VFS_PATH_MAX];
   VFS_LOGF("HostfsChown(%p, \"%s\", %d, %d)", parent, name, uid, gid);
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
   if (HostfsGetOptimalDirFdName(parent, name, &hostfd, hostname) == -1) {
     return -1;
   }
@@ -718,6 +721,9 @@ int HostfsChown(struct VfsInfo *parent, const char *name, uid_t uid, gid_t gid,
 int HostfsFchown(struct VfsInfo *info, uid_t uid, gid_t gid) {
   struct HostfsInfo *hostinfo;
   VFS_LOGF("HostfsFchown(%p, %d, %d)", info, uid, gid);
+  if (VfsHasSyntheticRootIdentity()) {
+    return 0;
+  }
   if (info == NULL) {
     return efault();
   }

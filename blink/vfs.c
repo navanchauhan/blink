@@ -83,6 +83,7 @@ static struct VfsInfo g_initialrootinfo = {
 struct VfsInfo *g_cwdinfo;
 struct VfsInfo *g_rootinfo;
 struct VfsInfo *g_actualrootinfo;
+static bool g_vfs_has_synthetic_root_identity;
 
 struct Vfs g_vfs = {
     .devices = NULL,
@@ -116,6 +117,11 @@ void VfsResetForReuse(void) {
   g_cwdinfo = NULL;
   g_rootinfo = NULL;
   g_actualrootinfo = NULL;
+  g_vfs_has_synthetic_root_identity = false;
+}
+
+bool VfsHasSyntheticRootIdentity(void) {
+  return g_vfs_has_synthetic_root_identity;
 }
 
 static bool VfsShouldMountSystemRoot(void) {
@@ -141,6 +147,8 @@ int VfsInitRootMount(const char *source, const char *fstype, u64 flags,
   struct VfsInfo *info;
   struct VfsMount *rootmount;
   int fd;
+
+  g_vfs_has_synthetic_root_identity = !mount_system_root;
 
   // Register built-in filesystems
   unassert(!VfsRegister(&g_hostfs));
