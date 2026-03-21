@@ -52,6 +52,7 @@ static void InitCxxFilt(void) {
   unassert(!pthread_mutexattr_destroy(&attr));
 }
 
+#ifdef HAVE_FORK
 static void CloseCxxFiltUnlocked(void) {
   sigset_t ss, oldss;
   if (g_cxxfilt.pid > 0) {
@@ -150,6 +151,26 @@ static void SpawnCxxFilt(void) {
                            CxxFiltAfterForkParent,  //
                            CxxFiltAfterForkChild));
 }
+#else
+static void CloseCxxFiltUnlocked(void) {
+  g_cxxfilt.pid = -1;
+}
+
+static void CloseCxxFilt(void) {
+  LOCK(&g_cxxfilt.lock);
+  CloseCxxFiltUnlocked();
+  UNLOCK(&g_cxxfilt.lock);
+}
+
+static void CxxFiltBeforeFork(void) {}
+static void CxxFiltAfterForkChild(void) {}
+static void CxxFiltAfterForkParent(void) {}
+
+static void SpawnCxxFilt(void) {
+  LOGF("host fork() unavailable, disabling c++ symbol demangler");
+  g_cxxfilt.pid = -1;
+}
+#endif
 
 static char *CopySymbol(char *p, size_t pn, const char *s, size_t sn) {
   size_t extra;

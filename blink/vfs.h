@@ -276,6 +276,10 @@ int VfsMunmap(void *, size_t);
 int VfsMprotect(void *, size_t, int);
 int VfsMsync(void *, size_t, int);
 
+int VfsInitRootMount(const char *, const char *, u64, const void *, bool,
+                     const char *);
+void VfsResetForReuse(void);
+void VfsCloseAll(void);
 int VfsInit(const char *);
 int VfsRegister(struct VfsSystem *);
 int VfsTraverse(const char *, struct VfsInfo **, bool);

@@ -93,11 +93,53 @@ struct Vfs g_vfs = {
     .mapslock = PTHREAD_MUTEX_INITIALIZER_,
 };
 
-int VfsInit(const char *prefix) {
-  struct stat st;
-  char *cwd, hostcwd[PATH_MAX], *bprefix = NULL;
+void VfsResetForReuse(void) {
+  memset(&g_vfs, 0, sizeof(g_vfs));
+  unassert(!pthread_mutex_init(&g_vfs.lock, 0));
+  unassert(!pthread_mutex_init(&g_vfs.mapslock, 0));
+  g_rootdevice = (struct VfsDevice){
+      .mounts = NULL,
+      .ops = NULL,
+      .data = NULL,
+      .dev = 0,
+      .refcount = 1u,
+  };
+  g_initialrootinfo = (struct VfsInfo){
+      .device = &g_rootdevice,
+      .parent = NULL,
+      .data = NULL,
+      .ino = 0,
+      .dev = 0,
+      .mode = S_IFDIR | 0755,
+      .refcount = 1u,
+  };
+  g_cwdinfo = NULL;
+  g_rootinfo = NULL;
+  g_actualrootinfo = NULL;
+}
+
+static bool VfsShouldMountSystemRoot(void) {
+  const char *value = getenv("OMNIKIT_VFS_NO_SYSTEMROOT");
+  return !(value && value[0] && strcmp(value, "0"));
+}
+
+static int VfsWrapGuestFd(int guestfd, int hostfd, bool dodup) {
   struct VfsInfo *info;
-  size_t hostcwdlen, prefixlen;
+  if (HostfsWrapFd(hostfd, dodup, &info) == -1) {
+    return -1;
+  }
+  if (VfsSetFd(guestfd, info) == -1) {
+    unassert(!VfsFreeInfo(info));
+    return -1;
+  }
+  return 0;
+}
+
+int VfsInitRootMount(const char *source, const char *fstype, u64 flags,
+                     const void *data, bool mount_system_root,
+                     const char *cwd) {
+  struct VfsInfo *info;
+  struct VfsMount *rootmount;
   int fd;
 
   // Register built-in filesystems
@@ -111,39 +153,36 @@ int VfsInit(const char *prefix) {
   // Initialize the root directory
   unassert(!VfsAcquireInfo(&g_initialrootinfo, &g_rootinfo));
   unassert(!VfsAcquireInfo(&g_initialrootinfo, &g_actualrootinfo));
-  if (prefix) {
-    bprefix = realpath(prefix, NULL);
+  if (VfsMount(source, "/", fstype, flags, data) == -1) {
+    goto cleananddie;
   }
-  if (bprefix) {
-    if (stat(bprefix, &st) == -1) {
-      ERRF("Failed to stat BLINK_PREFIX %s, %s", bprefix, strerror(errno));
-      free(bprefix);
-      bprefix = NULL;
-    } else if (!S_ISDIR(st.st_mode)) {
-      ERRF("BLINK_PREFIX %s is not a directory", bprefix);
-      free(bprefix);
-      bprefix = NULL;
-    }
-  }
-  if (bprefix) {
-    unassert(!VfsMount(bprefix, "/", "hostfs", 0, NULL));
-  } else {
-    unassert(!VfsMount("/", "/", "hostfs", 0, NULL));
-  }
+  unassert(dll_first(g_rootdevice.mounts) != NULL);
+  rootmount = VFS_MOUNT_CONTAINER(dll_first(g_rootdevice.mounts));
+  unassert(rootmount->root != NULL);
+  unassert(rootmount->root->device != NULL);
+  unassert(rootmount->root->device->ops != NULL);
   unassert(!VfsFreeInfo(g_rootinfo));
-  unassert(!VfsTraverse("/", &g_rootinfo, false));
+  unassert(!VfsAcquireInfo(rootmount->root, &g_rootinfo));
+  unassert(g_rootinfo->device != NULL);
+  unassert(g_rootinfo->device->ops != NULL);
 
   // Temporary cwd for syscalls to work during initialization
   unassert(!VfsChdir("/"));
+  unassert(g_cwdinfo != NULL);
+  unassert(g_cwdinfo->device != NULL);
+  unassert(g_cwdinfo->device->ops != NULL);
 
-  // Mount the host's root.
-  if (VfsMkdir(AT_FDCWD, VFS_SYSTEM_ROOT_MOUNT, 0755) == -1 &&
-      errno != EEXIST) {
-    ERRF("Failed to create system root mount directory, %s", strerror(errno));
-    goto cleananddie;
+  if (mount_system_root) {
+    // Mount the host's root for blink's default compatibility path.
+    if (VfsMkdir(AT_FDCWD, VFS_SYSTEM_ROOT_MOUNT, 0755) == -1 &&
+        errno != EEXIST) {
+      ERRF("Failed to create system root mount directory, %s", strerror(errno));
+      goto cleananddie;
+    }
+    unassert(VfsMount("/", VFS_SYSTEM_ROOT_MOUNT, "hostfs", 0, NULL) != -1);
   }
-  unassert(VfsMount("/", VFS_SYSTEM_ROOT_MOUNT, "hostfs", 0, NULL) != -1);
-  unassert(!VfsTraverse("/", &g_actualrootinfo, false));
+  unassert(!VfsFreeInfo(g_actualrootinfo));
+  unassert(!VfsAcquireInfo(rootmount->root, &g_actualrootinfo));
 
   // devfs, procfs
   if (VfsMkdir(AT_FDCWD, "/dev", 0755) == -1 && errno != EEXIST) {
@@ -157,41 +196,18 @@ int VfsInit(const char *prefix) {
   }
   unassert(!VfsMount("proc", "/proc", "proc", 0, NULL));
 
-  // Initialize the current working directory
-  unassert(getcwd(hostcwd, sizeof(hostcwd)));
-  if (bprefix && !strncmp(hostcwd, bprefix, (prefixlen = strlen(bprefix)))) {
-    hostcwdlen = strlen(hostcwd);
-    if (hostcwdlen == prefixlen) {
-      cwd = strdup("/");
-    } else {
-      cwd = (char *)malloc(hostcwdlen - prefixlen + 1);
-      if (cwd == NULL) {
-        enomem();
-        goto cleananddie;
-      }
-      memcpy(cwd, hostcwd + prefixlen, hostcwdlen - prefixlen + 1);
-    }
-  } else {
-    cwd = (char *)malloc(PATH_MAX + sizeof(VFS_SYSTEM_ROOT_MOUNT));
-    if (cwd == NULL) {
-      enomem();
+  if (cwd) {
+    if (VfsChdir(cwd) == -1) {
       goto cleananddie;
     }
-    memcpy(cwd, VFS_SYSTEM_ROOT_MOUNT, sizeof(VFS_SYSTEM_ROOT_MOUNT));
-    strcat(cwd, hostcwd);
+  } else {
+    unassert(!VfsChdir("/"));
   }
 
-  unassert(!VfsChdir(cwd));
-  free(cwd);
-  free(bprefix);
-
   // stdin, stdout, stderr
-  unassert(!HostfsWrapFd(0, false, &info));
-  unassert(VfsAddFd(info) == 0);
-  unassert(!HostfsWrapFd(1, false, &info));
-  unassert(VfsAddFd(info) == 1);
-  unassert(!HostfsWrapFd(2, false, &info));
-  unassert(VfsAddFd(info) == 2);
+  unassert(!VfsWrapGuestFd(0, 0, true));
+  unassert(!VfsWrapGuestFd(1, 1, true));
+  unassert(!VfsWrapGuestFd(2, 2, true));
 
   // Some Linux tests require that when EMFILE occurs,
   // the fd returned before it must be the maximum possible.
@@ -206,8 +222,73 @@ int VfsInit(const char *prefix) {
 
   return 0;
 cleananddie:
-  free(bprefix);
   return -1;
+}
+
+int VfsInit(const char *prefix) {
+  struct stat st;
+  char *bprefix = NULL;
+  char *cwd = NULL;
+  char hostcwd[PATH_MAX];
+  size_t hostcwdlen;
+  size_t prefixlen;
+  int rc;
+  bool mounts_system_root = VfsShouldMountSystemRoot();
+
+  if (prefix) {
+    bprefix = realpath(prefix, NULL);
+  }
+  if (bprefix) {
+    if (stat(bprefix, &st) == -1) {
+      ERRF("Failed to stat BLINK_PREFIX %s, %s", bprefix, strerror(errno));
+      free(bprefix);
+      bprefix = NULL;
+    } else if (!S_ISDIR(st.st_mode)) {
+      ERRF("BLINK_PREFIX %s is not a directory", bprefix);
+      free(bprefix);
+      bprefix = NULL;
+    }
+  }
+
+  if (mounts_system_root) {
+    unassert(getcwd(hostcwd, sizeof(hostcwd)));
+    if (bprefix && !strncmp(hostcwd, bprefix, (prefixlen = strlen(bprefix)))) {
+      hostcwdlen = strlen(hostcwd);
+      if (hostcwdlen == prefixlen) {
+        cwd = strdup("/");
+      } else {
+        cwd = (char *)malloc(hostcwdlen - prefixlen + 1);
+        if (cwd == NULL) {
+          enomem();
+          free(bprefix);
+          return -1;
+        }
+        memcpy(cwd, hostcwd + prefixlen, hostcwdlen - prefixlen + 1);
+      }
+    } else {
+      cwd = (char *)malloc(PATH_MAX + sizeof(VFS_SYSTEM_ROOT_MOUNT));
+      if (cwd == NULL) {
+        enomem();
+        free(bprefix);
+        return -1;
+      }
+      memcpy(cwd, VFS_SYSTEM_ROOT_MOUNT, sizeof(VFS_SYSTEM_ROOT_MOUNT));
+      strcat(cwd, hostcwd);
+    }
+  } else {
+    cwd = strdup("/");
+    if (cwd == NULL) {
+      enomem();
+      free(bprefix);
+      return -1;
+    }
+  }
+
+  rc = VfsInitRootMount(bprefix ? bprefix : "/", "hostfs", 0, NULL,
+                        mounts_system_root, cwd);
+  free(cwd);
+  free(bprefix);
+  return rc;
 }
 
 int VfsRegister(struct VfsSystem *system) {
@@ -824,6 +905,35 @@ int VfsSetFd(int fd, struct VfsInfo *data) {
   }
   UNLOCK(&g_vfs.lock);
   return 0;
+}
+
+void VfsCloseAll(void) {
+  struct Dll *e;
+  struct VfsFd *vfsfd;
+  struct VfsInfo *info;
+  int ret;
+
+  for (;;) {
+    LOCK(&g_vfs.lock);
+    e = dll_first(g_vfs.fds);
+    if (e == NULL) {
+      UNLOCK(&g_vfs.lock);
+      break;
+    }
+    vfsfd = VFS_FD_CONTAINER(e);
+    info = vfsfd->data;
+    dll_remove(&g_vfs.fds, &vfsfd->elem);
+    free(vfsfd);
+    UNLOCK(&g_vfs.lock);
+
+    ret = 0;
+    if (info->device->ops && info->device->ops->Close) {
+      ret = info->device->ops->Close(info);
+    }
+    if (ret != -1) {
+      unassert(!VfsFreeInfo(info));
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////

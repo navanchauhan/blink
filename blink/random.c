@@ -21,6 +21,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#if defined(__APPLE__)
+#include <stdlib.h>
+#endif
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -46,7 +49,17 @@
 bool __stdcall SystemFunction036(void *, __LONG32);
 #endif
 
-#if !defined(HAVE_SYS_GETRANDOM) && \
+#if defined(__has_include)
+#if __has_include(<sys/random.h>)
+#define BLINK_HAVE_SYS_RANDOM_H 1
+#endif
+#endif
+
+#ifndef BLINK_HAVE_SYS_RANDOM_H
+#define BLINK_HAVE_SYS_RANDOM_H 0
+#endif
+
+#if !defined(HAVE_SYS_GETRANDOM) && BLINK_HAVE_SYS_RANDOM_H && \
     (defined(HAVE_GETRANDOM) || defined(HAVE_SYS_GETENTROPY))
 #include <sys/random.h>
 #endif
@@ -99,6 +112,13 @@ static ssize_t GetWeakRandom(char *p, size_t n) {
   return n;
 }
 
+#ifdef __APPLE__
+static ssize_t GetArc4Random(char *p, size_t n) {
+  arc4random_buf(p, n);
+  return n;
+}
+#endif
+
 // "The user of getrandom() must always check the return value, to
 // determine whether either an error occurred or fewer bytes than
 // requested were returned. In the case where GRND_RANDOM is not
@@ -114,7 +134,10 @@ ssize_t GetRandom(void *p, size_t n, int flags) {
 #ifdef GRND_NONBLOCK
   _Static_assert(GRND_NONBLOCK == GRND_NONBLOCK_LINUX, "");
 #endif
-#ifdef HAVE_SYS_GETRANDOM
+#ifdef __APPLE__
+  (void)flags;
+  return GetArc4Random((char *)p, n);
+#elif defined(HAVE_SYS_GETRANDOM)
   // we need to favor SYS_getrandom right now since our ./configure
   // script isn't smart enough to accommodate our bundled toolchain
   return syscall(SYS_getrandom, p, n, flags);

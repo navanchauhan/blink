@@ -28,6 +28,10 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "blink/assert.h"
 #include "blink/errno.h"
 #include "blink/log.h"
@@ -883,7 +887,7 @@ int HostfsFdatasync(struct VfsInfo *info) {
     return efault();
   }
   hostinfo = (struct HostfsInfo *)info->data;
-#ifdef HAVE_FDATASYNC
+#if defined(HAVE_FDATASYNC) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
   return fdatasync(hostinfo->filefd);
 #else
   return fsync(hostinfo->filefd);

@@ -49,6 +49,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "blink/ancillary.h"
 #include "blink/assert.h"
 #include "blink/atomic.h"
@@ -78,6 +82,16 @@
 #include "blink/strace.h"
 #include "blink/swap.h"
 #include "blink/thread.h"
+
+#if defined(HAVE_CLOCK_SETTIME)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define BLINK_HAVE_CLOCK_SETTIME 0
+#else
+#define BLINK_HAVE_CLOCK_SETTIME 1
+#endif
+#else
+#define BLINK_HAVE_CLOCK_SETTIME 0
+#endif
 #include "blink/timespec.h"
 #include "blink/util.h"
 #include "blink/vfs.h"
@@ -400,6 +414,7 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
 }
 
 static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+#ifdef HAVE_FORK
   int pid, newpid = 0;
   _Atomic(int) *ctid_ptr;
   unassert(!m->path.jb);
@@ -473,6 +488,14 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
     }
   }
   return pid;
+#else
+  (void)m;
+  (void)flags;
+  (void)stack;
+  (void)ctid;
+  LOGF("forking support disabled");
+  return enosys();
+#endif
 }
 
 static int SysFork(struct Machine *m) {
@@ -4135,7 +4158,7 @@ static int SysClockGettime(struct Machine *m, int clock, i64 ts) {
   return rc;
 }
 
-#ifdef HAVE_CLOCK_SETTIME
+#if BLINK_HAVE_CLOCK_SETTIME
 static int SysClockSettime(struct Machine *m, int clock, i64 ts) {
   clock_t sysclock;
   struct timespec ht;
@@ -5581,7 +5604,7 @@ void OpSyscall(P) {
     SYSCALL(3, 0x0D9, "getdents", SysGetdents, STRACE_3);
     SYSCALL(1, 0x0DA, "set_tid_address", SysSetTidAddress, STRACE_1);
     SYSCALL(4, 0x0DD, "fadvise", SysFadvise, STRACE_4);
-#ifdef HAVE_CLOCK_SETTIME
+#if BLINK_HAVE_CLOCK_SETTIME
     SYSCALL(2, 0x0E3, "clock_settime", SysClockSettime, STRACE_2);
 #endif
     SYSCALL(2, 0x0E5, "clock_getres", SysClockGetres, STRACE_2);
