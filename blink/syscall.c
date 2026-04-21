@@ -66,6 +66,7 @@
 #include "blink/epollfd.h"
 #include "blink/eventfd.h"
 #include "blink/flag.h"
+#include "blink/inotifyfd.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
 #include "blink/linux.h"
@@ -283,6 +284,7 @@ bool CheckInterrupt(struct Machine *m, bool restartable) {
   int sig, delivered;
   // an actual i/o call just received EINTR from the kernel
 HandleSomeMoreInterrupts:
+  OmniNoForkPollState(m);
   if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
     errno = EINTR;
     m->interrupted = true;
@@ -372,6 +374,14 @@ static void ClearChildTid(struct Machine *m) {
 
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
+  if (OmniNoForkProcessHooksEnabled() && OmniNoForkIsManagedThread(m)) {
+    ClearChildTid(m);
+    OmniNoForkExitThreadGroup(m, rc);
+  }
+  if (OmniNoForkProcessHooksEnabled() && OmniNoForkIsPseudoProcess(m)) {
+    ClearChildTid(m);
+    OmniNoForkExitGroup(m, rc);
+  }
   ClearChildTid(m);
   if (m->system->isfork) {
 #ifndef NDEBUG
@@ -408,6 +418,10 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
 _Noreturn void SysExit(struct Machine *m, int rc) {
 #ifdef HAVE_THREADS
   THR_LOGF("pid=%d tid=%d SysExit", m->system->pid, m->tid);
+  if (OmniNoForkProcessHooksEnabled() && OmniNoForkIsManagedThread(m)) {
+    ClearChildTid(m);
+    OmniNoForkExitThread(m, rc);
+  }
   if (IsOrphan(m)) {
     SysExitGroup(m, rc);
   } else {
@@ -496,6 +510,9 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
   }
   return pid;
 #else
+  if (OmniNoForkProcessHooksEnabled()) {
+    return OmniNoForkFork(m, flags, stack, ctid);
+  }
   (void)m;
   (void)flags;
   (void)stack;
@@ -511,7 +528,7 @@ static int SysFork(struct Machine *m) {
 
 static int SysVfork(struct Machine *m) {
   // TODO: Parent should be stopped while child is running.
-  return SysFork(m);
+  return Fork(m, CLONE_VM_LINUX | CLONE_VFORK_LINUX | SIGCHLD_LINUX, 0, 0);
 }
 
 static void *OnSpawn(void *arg) {
@@ -551,7 +568,9 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
   supported = CLONE_THREAD_LINUX | CLONE_VM_LINUX | CLONE_FS_LINUX |
               CLONE_FILES_LINUX | CLONE_SIGHAND_LINUX | CLONE_SETTLS_LINUX |
               CLONE_PARENT_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX |
-              CLONE_CHILD_SETTID_LINUX | CLONE_SYSVSEM_LINUX;
+              CLONE_CHILD_SETTID_LINUX | CLONE_SYSVSEM_LINUX |
+              CLONE_PARENT_LINUX | CLONE_PTRACE_LINUX |
+              CLONE_UNTRACED_LINUX;
   mandatory = CLONE_THREAD_LINUX | CLONE_VM_LINUX | CLONE_FS_LINUX |
               CLONE_FILES_LINUX | CLONE_SIGHAND_LINUX;
   ignored = CLONE_DETACHED_LINUX | CLONE_IO_LINUX;
@@ -576,6 +595,12 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
         !(ctid_ptr = (_Atomic(int) *)LookupAddress(m, ctid))))) {
     LOGF("bad clone() ptid / ctid pointers: %#" PRIx64, flags);
     return efault();
+  }
+  if (OmniNoForkProcessHooksEnabled()) {
+    int nofork_rc = OmniNoForkSpawnThread(m, flags, stack, ptid, ctid, tls);
+    if (nofork_rc != -2) {
+      return nofork_rc;
+    }
   }
   m->threaded = true;
   m->system->jit.threaded = true;
@@ -627,6 +652,9 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
 #ifdef HAVE_FORK
     return Fork(m, flags, stack, ctid);
 #else
+    if (OmniNoForkProcessHooksEnabled()) {
+      return OmniNoForkFork(m, flags, stack, ctid);
+    }
     LOGF("forking support disabled");
     return enosys();
 #endif
@@ -3903,6 +3931,11 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
        !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
     return -1;
   }
+  if (OmniNoForkProcessHooksEnabled() &&
+      OmniNoForkWait4(m, pid, options, &rc, &wstatus) != -2) {
+    memset(&hrusage, 0, sizeof(hrusage));
+    goto FinishWait4;
+  }
 #ifdef HAVE_WAIT4
   RESTARTABLE(rc = wait4(pid, &wstatus, options, &hrusage));
 #else
@@ -3914,6 +3947,7 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
   }
   RESTARTABLE(rc = waitpid(pid, &wstatus, options));
 #endif
+FinishWait4:
   if (rc != -1 && rc != 0) {
     if (opt_out_wstatus_addr) {
 #ifdef WIFCONTINUED
@@ -5194,6 +5228,12 @@ static int SysKill(struct Machine *m, int pid, int sig) {
             m->tid, m->system->pid, pid, sig, XlatSignal(sig), m->ip);
     fflush(stderr);
   }
+  if (OmniNoForkProcessHooksEnabled()) {
+    int rc = OmniNoForkKill(m, pid, sig);
+    if (rc != -2) {
+      return rc;
+    }
+  }
   return kill(pid, sig ? XlatSignal(sig) : 0);
 }
 
@@ -5216,6 +5256,12 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
   if (!(0 <= sig && sig <= 64)) {
     LOGF("tkill(%d, %d) failed due to bogus signal", tid, sig);
     return einval();
+  }
+  if (OmniNoForkProcessHooksEnabled()) {
+    int nofork_rc = OmniNoForkTkill(m, tid, sig);
+    if (nofork_rc != -2) {
+      return nofork_rc;
+    }
   }
   // trigger signal immediately if possible
   if (tid == m->tid) {
@@ -5298,6 +5344,12 @@ static int SysTgkill(struct Machine *m, int pid, int tid, int sig) {
     fflush(stderr);
   }
   if (pid < 1 || tid < 1) return einval();
+  if (OmniNoForkProcessHooksEnabled()) {
+    int nofork_rc = OmniNoForkTgkill(m, pid, tid, sig);
+    if (nofork_rc != -2) {
+      return nofork_rc;
+    }
+  }
   if (pid != m->system->pid) return eperm();
 #ifdef HAVE_THREADS
   return SysTkill(m, tid, sig);
@@ -5313,15 +5365,60 @@ static int SysPause(struct Machine *m) {
   return rc;
 }
 
+static int SysPtrace(struct Machine *m, int request, int pid, i64 addr, i64 data) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    i64 rc = OmniNoForkPtrace(m, request, pid, addr, data);
+    if (rc != -2) {
+      return rc;
+    }
+  }
+  return enosys();
+}
+
+static int SysInotifyInit(struct Machine *m) {
+  (void)m;
+  return BlinkInotifyInit(0);
+}
+
+static int SysInotifyInit1(struct Machine *m, int flags) {
+  (void)m;
+  return BlinkInotifyInit(flags);
+}
+
+static int SysInotifyAddWatch(struct Machine *m, int fd, i64 pathname, u32 mask) {
+  return BlinkInotifyAddWatch(fd, LoadStr(m, pathname), mask);
+}
+
+static int SysInotifyRmWatch(struct Machine *m, int fd, int wd) {
+  (void)m;
+  return BlinkInotifyRmWatch(fd, wd);
+}
+
 static int SysSetsid(struct Machine *m) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    int sid = OmniNoForkSetsid(m);
+    if (sid != -2) {
+      return sid;
+    }
+  }
   return setsid();
 }
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    int sid = OmniNoForkGetsid(m, pid);
+    if (sid != -2) {
+      return sid;
+    }
+  }
   return getsid(pid);
 }
 
 static int SysGetpid(struct Machine *m) {
+  int pid;
+  if ((pid = OmniNoForkGetpid(m)) != -1) {
+    return pid;
+  }
   return m->system->pid;
 }
 
@@ -5330,6 +5427,10 @@ static int SysGettid(struct Machine *m) {
 }
 
 static int SysGetppid(struct Machine *m) {
+  int ppid;
+  if ((ppid = OmniNoForkGetppid(m)) != -1) {
+    return ppid;
+  }
   return getppid();
 }
 
@@ -5597,10 +5698,22 @@ static int SysSetgid(struct Machine *m, int gid) {
 }
 
 static int SysGetpgid(struct Machine *m, int pid) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    int pgid = OmniNoForkGetpgid(m, pid);
+    if (pgid != -2) {
+      return pgid;
+    }
+  }
   return getpgid(pid);
 }
 
 static int SysGetpgrp(struct Machine *m) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    int pgid = OmniNoForkGetpgrp(m);
+    if (pgid != -2) {
+      return pgid;
+    }
+  }
   return getpgid(0);
 }
 
@@ -5609,6 +5722,12 @@ static int SysAlarm(struct Machine *m, unsigned seconds) {
 }
 
 static int SysSetpgid(struct Machine *m, int pid, int gid) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    int rc = OmniNoForkSetpgid(m, pid, gid);
+    if (rc != -2) {
+      return rc;
+    }
+  }
   return setpgid(pid, gid);
 }
 
@@ -5987,6 +6106,9 @@ void OpSyscall(P) {
     SYSCALL(2, 0x061, "getrlimit", SysGetrlimit, STRACE_GETRLIMIT);
     SYSCALL(2, 0x062, "getrusage", SysGetrusage, STRACE_2);
     SYSCALL(1, 0x064, "times", SysTimes, STRACE_1);
+#ifndef DISABLE_NONPOSIX
+    SYSCALL(4, 0x065, "ptrace", SysPtrace, STRACE_4);
+#endif
     SYSCALL(0, 0x06F, "getpgrp", SysGetpgrp, STRACE_GETPGRP);
     SYSCALL(0, 0x070, "setsid", SysSetsid, STRACE_SETSID);
     SYSCALL(2, 0x073, "getgroups", SysGetgroups, STRACE_2);
@@ -6032,6 +6154,10 @@ void OpSyscall(P) {
     SYSCALL(3, 0x10A, "symlinkat", SysSymlinkat, STRACE_SYMLINKAT);
     SYSCALL(4, 0x10B, "readlinkat", SysReadlinkat, STRACE_READLINKAT);
     SYSCALL(3, 0x10C, "fchmodat", SysFchmodat, STRACE_FCHMODAT);
+    SYSCALL(0, 0x0FD, "inotify_init", SysInotifyInit, STRACE_0);
+    SYSCALL(3, 0x0FE, "inotify_add_watch", SysInotifyAddWatch, STRACE_3);
+    SYSCALL(2, 0x0FF, "inotify_rm_watch", SysInotifyRmWatch, STRACE_2);
+    SYSCALL(1, 0x126, "inotify_init1", SysInotifyInit1, STRACE_1);
 #ifndef DISABLE_SOCKETS
     SYSCALL(3, 0x029, "socket", SysSocket, STRACE_SOCKET);
     SYSCALL(3, 0x02A, "connect", SysConnect, STRACE_CONNECT);

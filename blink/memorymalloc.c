@@ -41,6 +41,7 @@
 #include "blink/timespec.h"
 #include "blink/types.h"
 #include "blink/util.h"
+#include "blink/vfs.h"
 #include "blink/x86.h"
 
 struct Allocator {
@@ -234,11 +235,16 @@ struct System *NewSystem(struct XedMachineMode mode) {
   }
   memset(s, 0, sizeof(*s));
   s->mode = mode;
+  if (VfsCloneProcess(&s->vfs, NULL) == -1) {
+    free(s);
+    return 0;
+  }
   if (s->mode.omode == XED_MODE_REAL) {
     u8 *real =
         Mmap(NULL, ROUNDUP(kRealSize, FLAG_pagesize), PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS_, -1, 0, "real");
     if (!real) {
+      VfsFreeProcess(s->vfs);
       free(s);
       enomem();
       return 0;
@@ -386,6 +392,7 @@ void FreeSystem(struct System *s) {
   (void)pthread_mutex_destroy(&s->sig_lock);
   free(s->elf.interpreter);
   DestroyFds(&s->fds);
+  VfsFreeProcess(s->vfs);
   free(s->elf.execfn);
   free(s->elf.prog);
   FreeFileMaps(s);

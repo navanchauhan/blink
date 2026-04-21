@@ -150,6 +150,9 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   int syssig;
   struct sigaction sa;
   unassert(!IsSignalIgnoredByDefault(sig));
+  if (OmniNoForkProcessHooksEnabled() && OmniNoForkIsPseudoProcess(m)) {
+    OmniNoForkExitSignal(m, sig);
+  }
   KillOtherThreads(m->system);
 #ifdef HAVE_JIT
   DisableJit(&m->system->jit);  // unmapping exec pages is slow
@@ -213,6 +216,7 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
   struct Machine *m, *old;
   if ((old = g_machine)) KillOtherThreads(old->system);
   unassert((g_machine = m = NewMachine(NewSystem(XED_MACHINE_MODE_LONG), 0)));
+  VfsSetCurrentProcess(m->system->vfs);
 #ifdef HAVE_JIT
   if (FLAG_nojit) DisableJit(&m->system->jit);
 #endif
@@ -241,6 +245,10 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
     LoadProgram(m, execfn, prog, argv, envp, NULL);
     m->system->fds.list = old->system->fds.list;
     old->system->fds.list = 0;
+    VfsFreeProcess(m->system->vfs);
+    m->system->vfs = old->system->vfs;
+    old->system->vfs = 0;
+    VfsSetCurrentProcess(m->system->vfs);
     // releasing the execve() lock must come after unlocking fds
     memcpy(&oldmask, &old->system->exec_sigmask, sizeof(oldmask));
     UNLOCK(&old->system->exec_lock);

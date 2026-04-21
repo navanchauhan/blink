@@ -274,6 +274,7 @@ void EnqueueSignal(struct Machine *m, int sig) {
 
 void CheckForSignals(struct Machine *m) {
   int sig;
+  OmniNoForkPollState(m);
   if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
     SysExit(m, 0);
 #ifndef DISABLE_JIT

@@ -155,6 +155,7 @@ static inline i64 ToGuest(void *r) {
 
 struct Dis;
 struct Machine;
+struct VfsProcess;
 typedef void (*nexgen32e_f)(P);
 
 struct FreeList {
@@ -310,6 +311,7 @@ struct System {
   uintptr_t ender;
   struct Jit jit;
   struct Fds fds;
+  struct VfsProcess *vfs;
   struct Elf elf;
   sigset_t exec_sigmask;
   struct sigaction_linux hands[64];

@@ -53,6 +53,14 @@ static int IoctlTiocgwinsz(struct Machine *m, int fd, i64 addr,
   int rc;
   struct winsize ws;
   struct winsize_linux gws;
+  if (OmniNoForkProcessHooksEnabled()) {
+    rc = OmniNoForkTcgetwinsize(m, fd, &ws);
+    if (rc != -2) {
+      if (rc == -1) return -1;
+      XlatWinsizeToLinux(&gws, &ws);
+      return CopyToUserWrite(m, addr, &gws, sizeof(gws));
+    }
+  }
   if ((rc = fn(fd, &ws)) != -1) {
     XlatWinsizeToLinux(&gws, &ws);
     if (CopyToUserWrite(m, addr, &gws, sizeof(gws)) == -1) rc = -1;
@@ -66,6 +74,12 @@ static int IoctlTiocswinsz(struct Machine *m, int fd, i64 addr,
   struct winsize_linux gws;
   if (CopyFromUserRead(m, &gws, addr, sizeof(gws)) == -1) return -1;
   XlatWinsizeToHost(&ws, &gws);
+  if (OmniNoForkProcessHooksEnabled()) {
+    int rc = OmniNoForkTcsetwinsize(m, fd, &ws);
+    if (rc != -2) {
+      return rc;
+    }
+  }
   return fn(fd, &ws);
 }
 
@@ -74,6 +88,14 @@ static int IoctlTcgets(struct Machine *m, int fd, i64 addr,
   int rc;
   struct termios tio;
   struct termios_linux gtio;
+  if (OmniNoForkProcessHooksEnabled()) {
+    rc = OmniNoForkTcgets(m, fd, &tio);
+    if (rc != -2) {
+      if (rc == -1) return -1;
+      XlatTermiosToLinux(&gtio, &tio);
+      return CopyToUserWrite(m, addr, &gtio, sizeof(gtio));
+    }
+  }
   if ((rc = fn(fd, &tio)) != -1) {
     XlatTermiosToLinux(&gtio, &tio);
     if (CopyToUserWrite(m, addr, &gtio, sizeof(gtio)) == -1) rc = -1;
@@ -87,6 +109,12 @@ static int IoctlTcsets(struct Machine *m, int fd, int request, i64 addr,
   struct termios_linux gtio;
   if (CopyFromUserRead(m, &gtio, addr, sizeof(gtio)) == -1) return -1;
   XlatLinuxToTermios(&tio, &gtio);
+  if (OmniNoForkProcessHooksEnabled()) {
+    int rc = OmniNoForkTcsets(m, fd, request, &tio);
+    if (rc != -2) {
+      return rc;
+    }
+  }
   return fn(fd, request, &tio);
 }
 
@@ -99,6 +127,14 @@ static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
   return -1;
 #endif
   if (!(pgrp = (u8 *)SchlepW(m, addr, 4))) return -1;
+  if (OmniNoForkProcessHooksEnabled()) {
+    rc = OmniNoForkTcgetpgrp(m, fd);
+    if (rc != -2) {
+      if (rc == -1) return -1;
+      Write32(pgrp, rc);
+      return 0;
+    }
+  }
   if ((rc = VfsTcgetpgrp(fd)) == -1) return -1;
   Write32(pgrp, rc);
   return 0;
@@ -107,6 +143,12 @@ static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
 static int IoctlTiocspgrp(struct Machine *m, int fd, i64 addr) {
   u8 *pgrp;
   if (!(pgrp = (u8 *)SchlepR(m, addr, 4))) return -1;
+  if (OmniNoForkProcessHooksEnabled()) {
+    int rc = OmniNoForkTcsetpgrp(m, fd, Read32(pgrp));
+    if (rc != -2) {
+      return rc;
+    }
+  }
   return VfsTcsetpgrp(fd, Read32(pgrp));
 }
 
@@ -232,6 +274,14 @@ static int IoctlTiocgsid(struct Machine *m, int fildes, i64 addr) {
   int rc;
   u8 *sid;
   if (!(sid = (u8 *)SchlepW(m, addr, 4))) return -1;
+  if (OmniNoForkProcessHooksEnabled()) {
+    rc = OmniNoForkTcgetsid(m, fildes);
+    if (rc != -2) {
+      if (rc == -1) return -1;
+      Write32(sid, rc);
+      return 0;
+    }
+  }
   if ((rc = VfsTcgetsid(fildes)) != -1) {
     Write32(sid, rc);
     rc = 0;

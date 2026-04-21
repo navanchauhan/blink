@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include "blink/devfs.h"
 #include "blink/errno.h"
 #include "blink/hostfs.h"
+#include "blink/inotifyfd.h"
 #include "blink/linux.h"
 #include "blink/log.h"
 #include "blink/macros.h"
@@ -80,21 +82,153 @@ static struct VfsInfo g_initialrootinfo = {
     .refcount = 1u,
 };
 
-struct VfsInfo *g_cwdinfo;
-struct VfsInfo *g_rootinfo;
-struct VfsInfo *g_actualrootinfo;
+static char *VfsBuildChildPath(struct VfsInfo *dir, const char *leaf) {
+  char *dirpath;
+  char *path;
+  size_t len;
+  if (dir == NULL || leaf == NULL) {
+    return NULL;
+  }
+  if (VfsPathBuildFull(dir, NULL, &dirpath) == -1) {
+    return NULL;
+  }
+  if (!strcmp(leaf, ".") || !strcmp(leaf, "/")) {
+    return dirpath;
+  }
+  len = strlen(dirpath) + strlen(leaf) + 2;
+  path = malloc(len);
+  if (path == NULL) {
+    free(dirpath);
+    return NULL;
+  }
+  if (!strcmp(dirpath, "/")) {
+    snprintf(path, len, "/%s", leaf);
+  } else {
+    snprintf(path, len, "%s/%s", dirpath, leaf);
+  }
+  free(dirpath);
+  return path;
+}
+
+static char *VfsBuildInfoPath(struct VfsInfo *info) {
+  char *path;
+  if (info == NULL) {
+    return NULL;
+  }
+  if (VfsPathBuildFull(info, NULL, &path) == -1) {
+    return NULL;
+  }
+  return path;
+}
+
+static struct VfsProcess g_vfs_bootstrap_process = {
+    .fds = NULL,
+    .cwdinfo = NULL,
+    .rootinfo = NULL,
+    .actualrootinfo = NULL,
+    .lock = PTHREAD_MUTEX_INITIALIZER_,
+};
+
+_Thread_local struct VfsProcess *g_vfs_process;
 static bool g_vfs_has_synthetic_root_identity;
 
 struct Vfs g_vfs = {
     .devices = NULL,
     .systems = NULL,
-    .fds = NULL,
     .maps = NULL,
     .lock = PTHREAD_MUTEX_INITIALIZER_,
     .mapslock = PTHREAD_MUTEX_INITIALIZER_,
 };
 
+static struct VfsProcess *VfsResolveProcess(void) {
+  if (g_vfs_process) {
+    return g_vfs_process;
+  }
+  return &g_vfs_bootstrap_process;
+}
+
+struct VfsProcess *VfsGetCurrentProcess(void) {
+  return VfsResolveProcess();
+}
+
+void VfsSetCurrentProcess(struct VfsProcess *process) {
+  g_vfs_process = process;
+}
+
+static void VfsCloseAllForProcess(struct VfsProcess *process);
+
+static int VfsInitProcessState(struct VfsProcess *process) {
+  int err;
+
+  memset(process, 0, sizeof(*process));
+  if ((err = pthread_mutex_init(&process->lock, 0)) != 0) {
+    errno = err;
+    return -1;
+  }
+  return 0;
+}
+
+static void VfsReleaseProcessRoots(struct VfsProcess *process) {
+  if (!process) return;
+  if (process->cwdinfo) {
+    unassert(!VfsFreeInfo(process->cwdinfo));
+    process->cwdinfo = NULL;
+  }
+  if (process->rootinfo) {
+    unassert(!VfsFreeInfo(process->rootinfo));
+    process->rootinfo = NULL;
+  }
+  if (process->actualrootinfo) {
+    unassert(!VfsFreeInfo(process->actualrootinfo));
+    process->actualrootinfo = NULL;
+  }
+}
+
+static void VfsDestroyProcessState(struct VfsProcess *process) {
+  if (!process) return;
+  VfsCloseAllForProcess(process);
+  VfsReleaseProcessRoots(process);
+  unassert(!pthread_mutex_destroy(&process->lock));
+}
+
+int VfsCreateProcess(struct VfsProcess **out) {
+  struct VfsProcess *process;
+
+  if (!out) {
+    return efault();
+  }
+  process = (struct VfsProcess *)malloc(sizeof(*process));
+  if (!process) {
+    return enomem();
+  }
+  if (VfsInitProcessState(process) == -1) {
+    free(process);
+    return -1;
+  }
+  *out = process;
+  return 0;
+}
+
+void VfsFreeProcess(struct VfsProcess *process) {
+  if (!process) return;
+  VfsDestroyProcessState(process);
+  free(process);
+}
+
+static int VfsDuplicateInfo(struct VfsInfo *info, struct VfsInfo **out) {
+  if (!info || !out) {
+    return efault();
+  }
+  if (info->device && info->device->ops && info->device->ops->Dup) {
+    return info->device->ops->Dup(info, out);
+  }
+  return VfsAcquireInfo(info, out);
+}
+
 void VfsResetForReuse(void) {
+  VfsCloseAllForProcess(&g_vfs_bootstrap_process);
+  VfsReleaseProcessRoots(&g_vfs_bootstrap_process);
+  unassert(!pthread_mutex_destroy(&g_vfs_bootstrap_process.lock));
   memset(&g_vfs, 0, sizeof(g_vfs));
   unassert(!pthread_mutex_init(&g_vfs.lock, 0));
   unassert(!pthread_mutex_init(&g_vfs.mapslock, 0));
@@ -114,10 +248,62 @@ void VfsResetForReuse(void) {
       .mode = S_IFDIR | 0755,
       .refcount = 1u,
   };
-  g_cwdinfo = NULL;
-  g_rootinfo = NULL;
-  g_actualrootinfo = NULL;
+  unassert(!VfsInitProcessState(&g_vfs_bootstrap_process));
+  g_vfs_process = &g_vfs_bootstrap_process;
   g_vfs_has_synthetic_root_identity = false;
+}
+
+static int VfsSetFdForProcess(struct VfsProcess *process, int fd,
+                              struct VfsInfo *data);
+
+int VfsCloneProcess(struct VfsProcess **out, const struct VfsProcess *src) {
+  struct VfsProcess *process;
+  struct Dll *e;
+  struct VfsFd *vfsfd;
+  struct VfsInfo *dupinfo;
+  const struct VfsProcess *source;
+
+  if (!out) {
+    return efault();
+  }
+  source = src ? src : VfsResolveProcess();
+  if (VfsCreateProcess(&process) == -1) {
+    return -1;
+  }
+  if (source->cwdinfo && VfsAcquireInfo(source->cwdinfo, &process->cwdinfo) == -1) {
+    goto fail;
+  }
+  if (source->rootinfo &&
+      VfsAcquireInfo(source->rootinfo, &process->rootinfo) == -1) {
+    goto fail;
+  }
+  if (source->actualrootinfo &&
+      VfsAcquireInfo(source->actualrootinfo, &process->actualrootinfo) == -1) {
+    goto fail;
+  }
+  LOCK(&((struct VfsProcess *)source)->lock);
+  for (e = dll_first(source->fds); e; e = dll_next(source->fds, e)) {
+    vfsfd = VFS_FD_CONTAINER(e);
+    dupinfo = NULL;
+    if (VfsDuplicateInfo(vfsfd->data, &dupinfo) == -1) {
+      UNLOCK(&((struct VfsProcess *)source)->lock);
+      goto fail;
+    }
+    if (VfsSetFdForProcess(process, vfsfd->fd, dupinfo) == -1) {
+      int saved_errno = errno;
+      unassert(!VfsFreeInfo(dupinfo));
+      UNLOCK(&((struct VfsProcess *)source)->lock);
+      errno = saved_errno;
+      goto fail;
+    }
+  }
+  UNLOCK(&((struct VfsProcess *)source)->lock);
+  *out = process;
+  return 0;
+
+fail:
+  VfsFreeProcess(process);
+  return -1;
 }
 
 bool VfsHasSyntheticRootIdentity(void) {
@@ -811,15 +997,17 @@ ssize_t VfsPathBuild(struct VfsInfo *info, struct VfsInfo *root, bool absolute,
 ////////////////////////////////////////////////////////////////////////////////
 
 int VfsAddFdAtOrAfter(struct VfsInfo *data, int minfd) {
+  struct VfsProcess *process;
   struct VfsFd *vfsfd;
   struct Dll *e;
+  process = VfsResolveProcess();
   vfsfd = (struct VfsFd *)malloc(sizeof(*vfsfd));
   if (vfsfd == NULL) {
     return -1;
   }
   vfsfd->data = data;
-  LOCK(&g_vfs.lock);
-  for (e = dll_first(g_vfs.fds); e; e = dll_next(g_vfs.fds, e)) {
+  LOCK(&process->lock);
+  for (e = dll_first(process->fds); e; e = dll_next(process->fds, e)) {
     if (VFS_FD_CONTAINER(e)->fd < minfd) {
       continue;
     } else if (VFS_FD_CONTAINER(e)->fd == minfd) {
@@ -831,16 +1019,16 @@ int VfsAddFdAtOrAfter(struct VfsInfo *data, int minfd) {
   vfsfd->fd = minfd;
   dll_init(&vfsfd->elem);
   if (e == NULL) {
-    dll_make_last(&g_vfs.fds, &vfsfd->elem);
+    dll_make_last(&process->fds, &vfsfd->elem);
   } else {
-    e = dll_prev(g_vfs.fds, e);
+    e = dll_prev(process->fds, e);
     if (e == NULL) {
-      dll_make_first(&g_vfs.fds, &vfsfd->elem);
+      dll_make_first(&process->fds, &vfsfd->elem);
     } else {
       dll_splice_after(e, &vfsfd->elem);
     }
   }
-  UNLOCK(&g_vfs.lock);
+  UNLOCK(&process->lock);
   return vfsfd->fd;
 }
 
@@ -853,63 +1041,73 @@ int VfsAddFd(struct VfsInfo *data) {
  * it.
  */
 int VfsFreeFd(int fd, struct VfsInfo **data) {
+  struct VfsProcess *process;
   struct Dll *e;
   struct VfsFd *vfsfd;
-  LOCK(&g_vfs.lock);
-  for (e = dll_first(g_vfs.fds); e;) {
+  process = VfsResolveProcess();
+  LOCK(&process->lock);
+  for (e = dll_first(process->fds); e;) {
     vfsfd = VFS_FD_CONTAINER(e);
     if (VFS_FD_CONTAINER(e)->fd == fd) {
       *data = vfsfd->data;
-      dll_remove(&g_vfs.fds, &vfsfd->elem);
+      dll_remove(&process->fds, &vfsfd->elem);
       free(vfsfd);
       VFS_LOGF("VfsFreeFd(%d)", fd);
-      UNLOCK(&g_vfs.lock);
+      UNLOCK(&process->lock);
       return 0;
     }
-    e = dll_next(g_vfs.fds, e);
+    e = dll_next(process->fds, e);
   }
-  UNLOCK(&g_vfs.lock);
+  UNLOCK(&process->lock);
   return ebadf();
 }
 
-int VfsGetFd(int fd, struct VfsInfo **output) {
+static int VfsGetFdForProcess(struct VfsProcess *process, int fd,
+                              struct VfsInfo **output) {
   struct Dll *e;
-  LOCK(&g_vfs.lock);
-  for (e = dll_first(g_vfs.fds); e; e = dll_next(g_vfs.fds, e)) {
+  LOCK(&process->lock);
+  for (e = dll_first(process->fds); e; e = dll_next(process->fds, e)) {
     if (VFS_FD_CONTAINER(e)->fd == fd) {
-      UNLOCK(&g_vfs.lock);
+      UNLOCK(&process->lock);
       unassert(!VfsAcquireInfo(VFS_FD_CONTAINER(e)->data, output));
       return 0;
     }
   }
-  UNLOCK(&g_vfs.lock);
+  UNLOCK(&process->lock);
   return ebadf();
 }
 
+int VfsGetFd(int fd, struct VfsInfo **output) {
+  return VfsGetFdForProcess(VfsResolveProcess(), fd, output);
+}
+
 int VfsNextFd(int fd) {
+  struct VfsProcess *process;
   struct Dll *e;
-  LOCK(&g_vfs.lock);
-  for (e = dll_first(g_vfs.fds); e; e = dll_next(g_vfs.fds, e)) {
+  process = VfsResolveProcess();
+  LOCK(&process->lock);
+  for (e = dll_first(process->fds); e; e = dll_next(process->fds, e)) {
     if (VFS_FD_CONTAINER(e)->fd > fd) {
       int nextfd = VFS_FD_CONTAINER(e)->fd;
-      UNLOCK(&g_vfs.lock);
+      UNLOCK(&process->lock);
       return nextfd;
     }
   }
-  UNLOCK(&g_vfs.lock);
+  UNLOCK(&process->lock);
   errno = ENOENT;
   return -1;
 }
 
-int VfsSetFd(int fd, struct VfsInfo *data) {
+static int VfsSetFdForProcess(struct VfsProcess *process, int fd,
+                              struct VfsInfo *data) {
   struct Dll *e;
   struct VfsFd *vfsfd;
-  LOCK(&g_vfs.lock);
-  for (e = dll_first(g_vfs.fds); e; e = dll_next(g_vfs.fds, e)) {
+  LOCK(&process->lock);
+  for (e = dll_first(process->fds); e; e = dll_next(process->fds, e)) {
     if (VFS_FD_CONTAINER(e)->fd == fd) {
       unassert(!VfsFreeInfo(VFS_FD_CONTAINER(e)->data));
       VFS_FD_CONTAINER(e)->data = data;
-      UNLOCK(&g_vfs.lock);
+      UNLOCK(&process->lock);
       return 0;
     } else if (VFS_FD_CONTAINER(e)->fd > fd) {
       break;
@@ -917,41 +1115,46 @@ int VfsSetFd(int fd, struct VfsInfo *data) {
   }
   vfsfd = (struct VfsFd *)malloc(sizeof(*vfsfd));
   if (vfsfd == NULL) {
-    UNLOCK(&g_vfs.lock);
+    UNLOCK(&process->lock);
     return enomem();
   }
   vfsfd->data = data;
   vfsfd->fd = fd;
   dll_init(&vfsfd->elem);
   if (e == NULL) {
-    dll_make_last(&g_vfs.fds, &vfsfd->elem);
-  } else if ((e = dll_prev(g_vfs.fds, e))) {
+    dll_make_last(&process->fds, &vfsfd->elem);
+  } else if ((e = dll_prev(process->fds, e))) {
     dll_splice_after(e, &vfsfd->elem);
   } else {
-    dll_make_first(&g_vfs.fds, &vfsfd->elem);
+    dll_make_first(&process->fds, &vfsfd->elem);
   }
-  UNLOCK(&g_vfs.lock);
+  UNLOCK(&process->lock);
   return 0;
 }
 
-void VfsCloseAll(void) {
+int VfsSetFd(int fd, struct VfsInfo *data) {
+  return VfsSetFdForProcess(VfsResolveProcess(), fd, data);
+}
+
+static void VfsCloseAllForProcess(struct VfsProcess *process) {
   struct Dll *e;
   struct VfsFd *vfsfd;
   struct VfsInfo *info;
   int ret;
 
+  if (!process) return;
   for (;;) {
-    LOCK(&g_vfs.lock);
-    e = dll_first(g_vfs.fds);
+    LOCK(&process->lock);
+    e = dll_first(process->fds);
     if (e == NULL) {
-      UNLOCK(&g_vfs.lock);
+      UNLOCK(&process->lock);
       break;
     }
     vfsfd = VFS_FD_CONTAINER(e);
     info = vfsfd->data;
-    dll_remove(&g_vfs.fds, &vfsfd->elem);
+    dll_remove(&process->fds, &vfsfd->elem);
     free(vfsfd);
-    UNLOCK(&g_vfs.lock);
+    UNLOCK(&process->lock);
 
     ret = 0;
     if (info->device->ops && info->device->ops->Close) {
@@ -961,6 +1164,10 @@ void VfsCloseAll(void) {
       unassert(!VfsFreeInfo(info));
     }
   }
+}
+
+void VfsCloseAll(void) {
+  VfsCloseAllForProcess(VfsResolveProcess());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1174,6 +1381,7 @@ cleananddie:
 
 int VfsUnlink(int dirfd, const char *name, int flags) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret;
   VFS_LOGF("VfsUnlink(%d, \"%s\", %d)", dirfd, name, flags);
@@ -1192,12 +1400,22 @@ int VfsUnlink(int dirfd, const char *name, int flags) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath,
+                                (flags & AT_REMOVEDIR) ? (IN_DELETE_SELF_LINUX | IN_ISDIR_LINUX)
+                                                       : IN_DELETE_SELF_LINUX,
+                                (flags & AT_REMOVEDIR) ? (IN_DELETE_LINUX | IN_ISDIR_LINUX)
+                                                       : IN_DELETE_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsMkdir(int dirfd, const char *name, mode_t mode) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret;
   VFS_LOGF("VfsMkdir(%d, \"%s\", %d)", dirfd, name, mode);
@@ -1216,12 +1434,19 @@ int VfsMkdir(int dirfd, const char *name, mode_t mode) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, 0,
+                                IN_CREATE_LINUX | IN_ISDIR_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsMkfifo(int dirfd, const char *name, mode_t mode) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret;
   VFS_LOGF("VfsMkfifo(%d, \"%s\", %d)", dirfd, name, mode);
@@ -1240,12 +1465,20 @@ int VfsMkfifo(int dirfd, const char *name, mode_t mode) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, 0, IN_CREATE_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsOpen(int dirfd, const char *name, int flags, int mode) {
   struct VfsInfo *dir, *out;
+  struct VfsInfo *existing = NULL;
+  char *fullpath = NULL;
+  bool existed = false;
   char newname[VFS_NAME_MAX];
   int ret = 0;
   VFS_LOGF("VfsOpen(%d, \"%s\", %d, %d)", dirfd, name, flags, mode);
@@ -1262,6 +1495,11 @@ int VfsOpen(int dirfd, const char *name, int flags, int mode) {
     ret = VfsHandleDirfdSymlink(&dir, newname);
   }
   unassert(!VfsTraverseMount(&dir, newname));
+  if (ret != -1 && (flags & O_CREAT) && dir->device->ops->Finddir &&
+      dir->device->ops->Finddir(dir, newname, &existing) != -1) {
+    existed = true;
+    unassert(!VfsFreeInfo(existing));
+  }
   if (ret != -1) {
     if (dir->device->ops->Open) {
       if (dir->device->ops->Open(dir, newname, flags, mode, &out) == -1) {
@@ -1273,12 +1511,23 @@ int VfsOpen(int dirfd, const char *name, int flags, int mode) {
       ret = eperm();
     }
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    if ((flags & O_CREAT) && !existed) {
+      BlinkInotifyNotifyPathEvent(fullpath, 0, IN_CREATE_LINUX);
+    }
+    if (flags & O_TRUNC) {
+      BlinkInotifyNotifyPathEvent(fullpath, IN_MODIFY_LINUX, IN_MODIFY_LINUX);
+    }
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsChmod(int dirfd, const char *name, mode_t mode, int flags) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret = 0;
   VFS_LOGF("VfsChmod(%d, \"%s\", %d, %d)", dirfd, name, mode, flags);
@@ -1302,12 +1551,18 @@ int VfsChmod(int dirfd, const char *name, mode_t mode, int flags) {
       ret = eperm();
     }
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_ATTRIB_LINUX, IN_ATTRIB_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsFchmod(int fd, mode_t mode) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsFchmod(%d, %d)", fd, mode);
   if (VfsGetFd(fd, &info) == -1) {
@@ -1318,7 +1573,12 @@ int VfsFchmod(int fd, mode_t mode) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_ATTRIB_LINUX, IN_ATTRIB_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1353,6 +1613,7 @@ int VfsAccess(int dirfd, const char *name, mode_t mode, int flags) {
 
 int VfsSymlink(const char *target, int dirfd, const char *name) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret;
   VFS_LOGF("VfsSymlink(\"%s\", %d, \"%s\")", target, dirfd, name);
@@ -1371,7 +1632,12 @@ int VfsSymlink(const char *target, int dirfd, const char *name) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, 0, IN_CREATE_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1403,6 +1669,7 @@ int VfsStat(int dirfd, const char *name, struct stat *st, int flags) {
 
 int VfsChown(int dirfd, const char *name, uid_t uid, gid_t gid, int flags) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret = 0;
   VFS_LOGF("VfsChown(%d, \"%s\", %d, %d, %d)", dirfd, name, uid, gid, flags);
@@ -1423,12 +1690,18 @@ int VfsChown(int dirfd, const char *name, uid_t uid, gid_t gid, int flags) {
       ret = eperm();
     }
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_ATTRIB_LINUX, IN_ATTRIB_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsFchown(int fd, uid_t uid, gid_t gid) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsFchown(%d, %d, %d)", fd, uid, gid);
   if (VfsGetFd(fd, &info) == -1) {
@@ -1439,13 +1712,20 @@ int VfsFchown(int fd, uid_t uid, gid_t gid) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_ATTRIB_LINUX, IN_ATTRIB_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsRename(int olddirfd, const char *oldname, int newdirfd,
               const char *newname) {
   struct VfsInfo *olddir, *newdir;
+  char *oldpath = NULL;
+  char *newpath = NULL;
   char newoldname[VFS_NAME_MAX], newnewname[VFS_NAME_MAX];
   int ret;
   VFS_LOGF("VfsRename(%d, \"%s\", %d, \"%s\")", olddirfd, oldname, newdirfd,
@@ -1465,6 +1745,8 @@ int VfsRename(int olddirfd, const char *oldname, int newdirfd,
   }
   unassert(!VfsTraverseMount(&olddir, newoldname));
   unassert(!VfsTraverseMount(&newdir, newnewname));
+  oldpath = VfsBuildChildPath(olddir, newoldname);
+  newpath = VfsBuildChildPath(newdir, newnewname);
   if (olddir->device->ops->Rename) {
     ret = olddir->device->ops->Rename(olddir, newoldname, newdir, newnewname);
   } else {
@@ -1472,6 +1754,12 @@ int VfsRename(int olddirfd, const char *oldname, int newdirfd,
   }
   unassert(!VfsFreeInfo(olddir));
   unassert(!VfsFreeInfo(newdir));
+  if (ret != -1 && oldpath != NULL && newpath != NULL) {
+    BlinkInotifyNotifyMoveEvent(oldpath, newpath, IN_MOVE_SELF_LINUX,
+                                IN_MOVED_FROM_LINUX, IN_MOVED_TO_LINUX);
+  }
+  free(oldpath);
+  free(newpath);
   return ret;
 }
 
@@ -1518,6 +1806,7 @@ ssize_t VfsReadlink(int dirfd, const char *name, char *buf, size_t bufsiz) {
 int VfsLink(int olddirfd, const char *oldname, int newdirfd,
             const char *newname, int flags) {
   struct VfsInfo *olddir, *newdir;
+  char *newpath = NULL;
   char newoldname[VFS_NAME_MAX], newnewname[VFS_NAME_MAX];
   int ret;
   VFS_LOGF("VfsLink(%d, \"%s\", %d, \"%s\", %d)", olddirfd, oldname, newdirfd,
@@ -1552,14 +1841,20 @@ int VfsLink(int olddirfd, const char *oldname, int newdirfd,
   } else {
     ret = eperm();
   }
+  newpath = ret != -1 ? VfsBuildChildPath(newdir, newnewname) : NULL;
   unassert(!VfsFreeInfo(olddir));
   unassert(!VfsFreeInfo(newdir));
+  if (ret != -1 && newpath != NULL) {
+    BlinkInotifyNotifyPathEvent(newpath, 0, IN_CREATE_LINUX);
+    free(newpath);
+  }
   return ret;
 }
 
 int VfsUtime(int dirfd, const char *name, const struct timespec times[2],
              int flags) {
   struct VfsInfo *dir;
+  char *fullpath = NULL;
   char newname[VFS_NAME_MAX];
   int ret = -1;
   VFS_LOGF("VfsUtime(%d, \"%s\", %p, %d)", dirfd, name, times, flags);
@@ -1583,12 +1878,18 @@ int VfsUtime(int dirfd, const char *name, const struct timespec times[2],
       ret = eperm();
     }
   }
+  fullpath = ret != -1 ? VfsBuildChildPath(dir, newname) : NULL;
   unassert(!VfsFreeInfo(dir));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_ATTRIB_LINUX, IN_ATTRIB_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
 int VfsFutime(int fd, const struct timespec times[2]) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsFutime(%d, %p)", fd, times);
   if (VfsGetFd(fd, &info) == -1) {
@@ -1600,7 +1901,12 @@ int VfsFutime(int fd, const struct timespec times[2]) {
     unassert(!VfsFreeInfo(info));
     return eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_ATTRIB_LINUX, IN_ATTRIB_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1626,6 +1932,7 @@ int VfsFstat(int fd, struct stat *st) {
 
 int VfsFtruncate(int fd, off_t length) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsFtruncate(%d, %ld)", fd, length);
   if (VfsGetFd(fd, &info) == -1) {
@@ -1637,7 +1944,12 @@ int VfsFtruncate(int fd, off_t length) {
     unassert(!VfsFreeInfo(info));
     return eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_MODIFY_LINUX, IN_MODIFY_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1678,6 +1990,7 @@ ssize_t VfsRead(int fd, void *buf, size_t nbyte) {
 
 ssize_t VfsWrite(int fd, const void *buf, size_t nbyte) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsWrite(%d, %p, %zu)", fd, buf, nbyte);
   if (buf == NULL) {
@@ -1691,7 +2004,12 @@ ssize_t VfsWrite(int fd, const void *buf, size_t nbyte) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_MODIFY_LINUX, IN_MODIFY_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1716,6 +2034,7 @@ ssize_t VfsPread(int fd, void *buf, size_t nbyte, off_t offset) {
 
 ssize_t VfsPwrite(int fd, const void *buf, size_t nbyte, off_t offset) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsPwrite(%d, %p, %zu, %ld)", fd, buf, nbyte, offset);
   if (buf == NULL) {
@@ -1729,7 +2048,12 @@ ssize_t VfsPwrite(int fd, const void *buf, size_t nbyte, off_t offset) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_MODIFY_LINUX, IN_MODIFY_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1751,6 +2075,7 @@ ssize_t VfsReadv(int fd, const struct iovec *iov, int iovcnt) {
 
 ssize_t VfsWritev(int fd, const struct iovec *iov, int iovcnt) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsWritev(%d, %p, %d)", fd, iov, iovcnt);
   if (VfsGetFd(fd, &info) == -1) {
@@ -1761,7 +2086,12 @@ ssize_t VfsWritev(int fd, const struct iovec *iov, int iovcnt) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_MODIFY_LINUX, IN_MODIFY_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -1783,6 +2113,7 @@ ssize_t VfsPreadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
 
 ssize_t VfsPwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
   struct VfsInfo *info;
+  char *fullpath = NULL;
   int ret;
   VFS_LOGF("VfsPwritev(%d, %p, %d, %ld)", fd, iov, iovcnt, offset);
   if (VfsGetFd(fd, &info) == -1) {
@@ -1793,7 +2124,12 @@ ssize_t VfsPwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
   } else {
     ret = eperm();
   }
+  fullpath = ret != -1 ? VfsBuildInfoPath(info) : NULL;
   unassert(!VfsFreeInfo(info));
+  if (ret != -1 && fullpath != NULL) {
+    BlinkInotifyNotifyPathEvent(fullpath, IN_MODIFY_LINUX, IN_MODIFY_LINUX);
+    free(fullpath);
+  }
   return ret;
 }
 
@@ -2089,27 +2425,29 @@ void VfsRewinddir(DIR *dir) {
 }
 
 int VfsClosedir(DIR *dir) {
+  struct VfsProcess *process;
   struct VfsInfo *info;
   struct Dll *e;
   struct VfsFd *vfsfd;
   int ret;
   VFS_LOGF("VfsClosedir(%p)", dir);
   info = (struct VfsInfo *)dir;
+  process = VfsResolveProcess();
   if (info->device->ops->Closedir) {
     ret = info->device->ops->Closedir(info);
     if (ret != -1) {
-      LOCK(&g_vfs.lock);
-      for (e = dll_first(g_vfs.fds); e;) {
+      LOCK(&process->lock);
+      for (e = dll_first(process->fds); e;) {
         vfsfd = VFS_FD_CONTAINER(e);
-        e = dll_next(g_vfs.fds, e);
+        e = dll_next(process->fds, e);
         if (vfsfd->data == info) {
           unassert(!VfsFreeInfo(vfsfd->data));
-          dll_remove(&g_vfs.fds, &vfsfd->elem);
+          dll_remove(&process->fds, &vfsfd->elem);
           free(vfsfd);
           break;
         }
       }
-      UNLOCK(&g_vfs.lock);
+      UNLOCK(&process->lock);
     }
   } else {
     ret = eperm();

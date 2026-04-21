@@ -31,14 +31,22 @@ struct VfsInfo;
 struct VfsSystem;
 struct VfsFd;
 struct VfsMap;
+struct VfsProcess;
 
 struct Vfs {
   struct Dll *devices GUARDED_BY(lock);
   struct Dll *systems GUARDED_BY(lock);
-  struct Dll *fds GUARDED_BY(lock);
   struct Dll *maps GUARDED_BY(mapslock);
   pthread_mutex_t_ lock;
   pthread_mutex_t_ mapslock;
+};
+
+struct VfsProcess {
+  struct Dll *fds GUARDED_BY(lock);
+  struct VfsInfo *cwdinfo;
+  struct VfsInfo *rootinfo;
+  struct VfsInfo *actualrootinfo;
+  pthread_mutex_t_ lock;
 };
 
 struct VfsOps {
@@ -179,9 +187,17 @@ struct VfsInfo {
 };
 
 extern struct Vfs g_vfs;
-extern struct VfsInfo *g_cwdinfo;
-extern struct VfsInfo *g_rootinfo;
-extern struct VfsInfo *g_actualrootinfo;
+extern _Thread_local struct VfsProcess *g_vfs_process;
+
+struct VfsProcess *VfsGetCurrentProcess(void);
+void VfsSetCurrentProcess(struct VfsProcess *);
+int VfsCreateProcess(struct VfsProcess **);
+int VfsCloneProcess(struct VfsProcess **, const struct VfsProcess *);
+void VfsFreeProcess(struct VfsProcess *);
+
+#define g_cwdinfo        (VfsGetCurrentProcess()->cwdinfo)
+#define g_rootinfo       (VfsGetCurrentProcess()->rootinfo)
+#define g_actualrootinfo (VfsGetCurrentProcess()->actualrootinfo)
 
 #define VFS_SYSTEM_CONTAINER(e) DLL_CONTAINER(struct VfsSystem, elem, (e))
 #define VFS_MOUNT_CONTAINER(e)  DLL_CONTAINER(struct VfsMount, elem, (e))
