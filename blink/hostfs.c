@@ -749,6 +749,11 @@ int HostfsClose(struct VfsInfo *info) {
     return efault();
   }
   hostinfo = (struct HostfsInfo *)info->data;
+  if (getenv("OMNIKIT_DEBUG_HOSTFS_FDS")) {
+    fprintf(stderr, "[hostfs-fd] close fd=%d ino=%" PRIu64 " mode=%#o\n",
+            hostinfo->filefd, info->ino, info->mode);
+    fflush(stderr);
+  }
   ret = close(hostinfo->filefd);
   hostinfo->filefd = -1;
   return ret;
@@ -1004,6 +1009,11 @@ int HostfsDup(struct VfsInfo *info, struct VfsInfo **newinfo) {
   newhostinfo->filefd = dup(hostinfo->filefd);
   if (newhostinfo->filefd == -1) {
     goto cleananddie;
+  }
+  if (getenv("OMNIKIT_DEBUG_HOSTFS_FDS")) {
+    fprintf(stderr, "[hostfs-fd] dup old=%d new=%d ino=%" PRIu64 " mode=%#o\n",
+            hostinfo->filefd, newhostinfo->filefd, info->ino, info->mode);
+    fflush(stderr);
   }
   newhostinfo->mode = hostinfo->mode;
   if (S_ISSOCK(hostinfo->mode) && hostinfo->socketaddr != NULL) {
@@ -1766,6 +1776,10 @@ int HostfsPipe(struct VfsInfo *infos[2]) {
   if (pipe(fds) == -1) {
     return -1;
   }
+  if (getenv("OMNIKIT_DEBUG_HOSTFS_FDS")) {
+    fprintf(stderr, "[hostfs-fd] pipe read=%d write=%d\n", fds[0], fds[1]);
+    fflush(stderr);
+  }
   for (i = 0; i < 2; ++i) {
     if (HostfsWrapFd(fds[i], false, &infos[i]) == -1) {
       goto cleananddie;
@@ -1796,6 +1810,11 @@ int HostfsPipe2(struct VfsInfo *infos[2], int flags) {
   infos[0] = infos[1] = NULL;
   if (pipe2(fds, flags) == -1) {
     return -1;
+  }
+  if (getenv("OMNIKIT_DEBUG_HOSTFS_FDS")) {
+    fprintf(stderr, "[hostfs-fd] pipe2 read=%d write=%d flags=%#x\n", fds[0],
+            fds[1], flags);
+    fflush(stderr);
   }
   for (i = 0; i < 2; ++i) {
     if (HostfsWrapFd(fds[i], false, &infos[i]) == -1) {

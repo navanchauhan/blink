@@ -342,7 +342,7 @@ int vidya;
 int ttyin;
 
 struct Pty *pty;
-struct Machine *m;
+_Thread_local struct Machine *m;
 
 static bool belay;
 static bool react;

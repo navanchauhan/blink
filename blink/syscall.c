@@ -66,6 +66,7 @@
 #include "blink/epollfd.h"
 #include "blink/eventfd.h"
 #include "blink/flag.h"
+#include "blink/flags.h"
 #include "blink/inotifyfd.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
@@ -285,6 +286,9 @@ bool CheckInterrupt(struct Machine *m, bool restartable) {
   // an actual i/o call just received EINTR from the kernel
 HandleSomeMoreInterrupts:
   OmniNoForkPollState(m);
+  if (OmniNoForkProcessHooksEnabled() && m->system->exited && m->canhalt) {
+    HaltMachine(m, kMachineExitTrap);
+  }
   if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
     errno = EINTR;
     m->interrupted = true;
@@ -435,6 +439,9 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
 }
 
 static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+  if (OmniNoForkProcessHooksEnabled()) {
+    return OmniNoForkFork(m, flags, stack, ctid);
+  }
 #ifdef HAVE_FORK
   int pid, newpid = 0;
   _Atomic(int) *ctid_ptr;
@@ -510,9 +517,6 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
   }
   return pid;
 #else
-  if (OmniNoForkProcessHooksEnabled()) {
-    return OmniNoForkFork(m, flags, stack, ctid);
-  }
   (void)m;
   (void)flags;
   (void)stack;
@@ -649,15 +653,7 @@ static bool IsForkOrVfork(u64 flags) {
 static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
                     u64 tls, u64 func) {
   if (IsForkOrVfork(flags)) {
-#ifdef HAVE_FORK
     return Fork(m, flags, stack, ctid);
-#else
-    if (OmniNoForkProcessHooksEnabled()) {
-      return OmniNoForkFork(m, flags, stack, ctid);
-    }
-    LOGF("forking support disabled");
-    return enosys();
-#endif
   }
 #ifdef HAVE_THREADS
   return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
@@ -3920,10 +3916,13 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
                     int options, i64 opt_out_rusage_addr) {
   int rc;
   int wstatus;
+  bool nofork_wait_status = false;
+  int saved_errno = 0;
   i32 gwstatus;
   u8 gwstatusb[4];
   struct rusage hrusage;
   struct rusage_linux grusage;
+  static _Atomic unsigned nofork_wait4_log_count;
   if ((options = XlatWait(options)) == -1) return -1;
   if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
                                               sizeof(gwstatusb), PROT_WRITE)) ||
@@ -3933,7 +3932,9 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
   }
   if (OmniNoForkProcessHooksEnabled() &&
       OmniNoForkWait4(m, pid, options, &rc, &wstatus) != -2) {
+    nofork_wait_status = true;
     memset(&hrusage, 0, sizeof(hrusage));
+    saved_errno = errno;
     goto FinishWait4;
   }
 #ifdef HAVE_WAIT4
@@ -3948,30 +3949,51 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
   RESTARTABLE(rc = waitpid(pid, &wstatus, options));
 #endif
 FinishWait4:
+  if (rc == -1) {
+    saved_errno = errno;
+  }
+  if (OmniNoForkProcessHooksEnabled() && getenv("OMNIKIT_DEBUG_NOFORK_WAIT")) {
+    unsigned count =
+        atomic_fetch_add_explicit(&nofork_wait4_log_count, 1,
+                                  memory_order_relaxed) +
+        1;
+    if (count <= 32 || !(count % 1024)) {
+      fprintf(stderr,
+              "[nofork-wait] syscall wait4 guestpid=%d target=%d opts=%d rc=%d errno=%d ip=%#" PRIx64
+              " ax=%#" PRIx64 " count=%u\n",
+              m->system->pid, pid, options, rc, saved_errno, m->ip, Get64(m->ax),
+              count);
+      fflush(stderr);
+    }
+  }
   if (rc != -1 && rc != 0) {
     if (opt_out_wstatus_addr) {
-#ifdef WIFCONTINUED
-      if (WIFCONTINUED(wstatus)) {
-        gwstatus = 0xffff;
-        SYS_LOGF("pid %d continued", rc);
-      } else
-#endif
-          if (WIFEXITED(wstatus)) {
-        int exitcode;
-        exitcode = WEXITSTATUS(wstatus) & 255;
-        gwstatus = exitcode << 8;
-        SYS_LOGF("pid %d exited %d", rc, exitcode);
-      } else if (WIFSTOPPED(wstatus)) {
-        int stopsig;
-        stopsig = UnXlatSignal(WSTOPSIG(wstatus));
-        gwstatus = stopsig << 8 | 127;
-        SYS_LOGF("pid %d stopped %s", rc, DescribeSignal(stopsig));
+      if (nofork_wait_status) {
+        gwstatus = wstatus;
       } else {
-        int termsig;
-        unassert(WIFSIGNALED(wstatus));
-        termsig = UnXlatSignal(WTERMSIG(wstatus));
-        SYS_LOGF("pid %d terminated %s", rc, DescribeSignal(termsig));
-        gwstatus = termsig & 127;
+#ifdef WIFCONTINUED
+        if (WIFCONTINUED(wstatus)) {
+          gwstatus = 0xffff;
+          SYS_LOGF("pid %d continued", rc);
+        } else
+#endif
+            if (WIFEXITED(wstatus)) {
+          int exitcode;
+          exitcode = WEXITSTATUS(wstatus) & 255;
+          gwstatus = exitcode << 8;
+          SYS_LOGF("pid %d exited %d", rc, exitcode);
+        } else if (WIFSTOPPED(wstatus)) {
+          int stopsig;
+          stopsig = UnXlatSignal(WSTOPSIG(wstatus));
+          gwstatus = stopsig << 8 | 127;
+          SYS_LOGF("pid %d stopped %s", rc, DescribeSignal(stopsig));
+        } else {
+          int termsig;
+          unassert(WIFSIGNALED(wstatus));
+          termsig = UnXlatSignal(WTERMSIG(wstatus));
+          SYS_LOGF("pid %d terminated %s", rc, DescribeSignal(termsig));
+          gwstatus = termsig & 127;
+        }
       }
       Write32(gwstatusb, gwstatus);
       CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
@@ -3980,6 +4002,9 @@ FinishWait4:
       XlatRusageToLinux(&grusage, &hrusage);
       CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
     }
+  }
+  if (rc == -1) {
+    errno = saved_errno;
   }
   return rc;
 }
@@ -4407,6 +4432,31 @@ static int SigsuspendPolyfill(struct Machine *m, u64 mask) {
   return -1;
 }
 
+static int PausePolyfill(struct Machine *m) {
+  long nanos;
+  struct timespec ts;
+  nanos = 1;
+  while (!CheckInterrupt(m, false)) {
+    if (nanos > 256) {
+      if (nanos < 10 * 1000) {
+#ifdef HAVE_SCHED_YIELD
+        sched_yield();
+#endif
+      } else {
+        ts = FromNanoseconds(nanos);
+        if (nanosleep(&ts, 0)) {
+          unassert(errno == EINTR);
+          continue;
+        }
+      }
+    }
+    if (nanos < 100 * 1000 * 1000) {
+      nanos <<= 1;
+    }
+  }
+  return -1;
+}
+
 static int SysSigsuspend(struct Machine *m, i64 maskaddr, i64 sigsetsize) {
   u8 word[8];
   if (sigsetsize != 8) return einval();
@@ -4414,6 +4464,9 @@ static int SysSigsuspend(struct Machine *m, i64 maskaddr, i64 sigsetsize) {
 #ifdef __EMSCRIPTEN__
   return SigsuspendPolyfill(m, Read64(word));
 #else
+  if (OmniNoForkProcessHooksEnabled()) {
+    return SigsuspendPolyfill(m, Read64(word));
+  }
   return SigsuspendActual(m, Read64(word));
 #endif
 }
@@ -5361,8 +5414,15 @@ static int SysTgkill(struct Machine *m, int pid, int tid, int sig) {
 
 static int SysPause(struct Machine *m) {
   int rc;
+#ifdef __EMSCRIPTEN__
+  return PausePolyfill(m);
+#else
+  if (OmniNoForkProcessHooksEnabled()) {
+    return PausePolyfill(m);
+  }
   NORESTART(rc, pause());
   return rc;
+#endif
 }
 
 static int SysPtrace(struct Machine *m, int request, int pid, i64 addr, i64 data) {
@@ -5375,14 +5435,37 @@ static int SysPtrace(struct Machine *m, int request, int pid, i64 addr, i64 data
   return enosys();
 }
 
+static int SysInotifyInitImpl(struct Machine *m, int flags) {
+  int lim;
+  int fildes;
+  int oflags;
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  if ((fildes = BlinkInotifyInit(flags)) == -1) {
+    return -1;
+  }
+  if (fildes >= lim) {
+    VfsClose(fildes);
+    return emfile();
+  }
+  oflags = O_RDONLY;
+  if (flags & IN_CLOEXEC_LINUX) {
+    oflags |= O_CLOEXEC;
+  }
+  if (flags & IN_NONBLOCK_LINUX) {
+    oflags |= O_NDELAY;
+  }
+  LOCK(&m->system->fds.lock);
+  unassert(AddFd(&m->system->fds, fildes, oflags));
+  UNLOCK(&m->system->fds.lock);
+  return fildes;
+}
+
 static int SysInotifyInit(struct Machine *m) {
-  (void)m;
-  return BlinkInotifyInit(0);
+  return SysInotifyInitImpl(m, 0);
 }
 
 static int SysInotifyInit1(struct Machine *m, int flags) {
-  (void)m;
-  return BlinkInotifyInit(flags);
+  return SysInotifyInitImpl(m, flags);
 }
 
 static int SysInotifyAddWatch(struct Machine *m, int fd, i64 pathname, u32 mask) {
@@ -6032,6 +6115,9 @@ void OpSyscall(P) {
   // we need to save the current mark, so we don't collect parent's data
   mark = m->freelist.n;
   m->interrupted = false;
+  // x86-64 SYSCALL clobbers rcx with the return RIP and r11 with rflags.
+  Put64(m->cx, m->ip);
+  Put64(m->r11, ExportFlags(m->flags));
   ax = Get64(m->ax);
   di = Get64(m->di);
   si = Get64(m->si);

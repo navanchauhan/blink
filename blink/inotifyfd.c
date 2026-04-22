@@ -77,6 +77,7 @@ static pthread_mutex_t g_inotify_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct BlinkInotifyState *g_inotify_registry = NULL;
 static _Atomic(u32) g_inotify_cookie = 1;
 
+static ssize_t BlinkInotifyRead(struct VfsInfo *info, void *buf, size_t size);
 static ssize_t BlinkInotifyReadv(struct VfsInfo *info, const struct iovec *iov,
                                  int iovcnt);
 static int BlinkInotifyPoll(struct VfsInfo **infos, struct pollfd *fds,
@@ -242,6 +243,7 @@ static struct VfsSystem g_inotifysystem = {
         {
             .Freeinfo = BlinkInotifyFreeinfo,
             .Fstat = BlinkInotifyFstat,
+            .Read = BlinkInotifyRead,
             .Readv = BlinkInotifyReadv,
             .Fcntl = BlinkInotifyFcntl,
             .Dup = BlinkInotifyDup,
@@ -451,6 +453,13 @@ static ssize_t BlinkInotifyReadv(struct VfsInfo *info, const struct iovec *iov,
 
   UNLOCK(&state->lock);
   return total;
+}
+
+static ssize_t BlinkInotifyRead(struct VfsInfo *info, void *buf, size_t size) {
+  struct iovec iov;
+  iov.iov_base = buf;
+  iov.iov_len = size;
+  return BlinkInotifyReadv(info, &iov, 1);
 }
 
 static int BlinkGetInotifyState(int fd, struct BlinkInotifyState **out) {

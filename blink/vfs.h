@@ -194,6 +194,8 @@ void VfsSetCurrentProcess(struct VfsProcess *);
 int VfsCreateProcess(struct VfsProcess **);
 int VfsCloneProcess(struct VfsProcess **, const struct VfsProcess *);
 void VfsFreeProcess(struct VfsProcess *);
+void VfsDebugDumpProcessFds(const char *, struct VfsProcess *);
+void VfsDebugDumpBootstrapFds(const char *);
 
 #define g_cwdinfo        (VfsGetCurrentProcess()->cwdinfo)
 #define g_rootinfo       (VfsGetCurrentProcess()->rootinfo)

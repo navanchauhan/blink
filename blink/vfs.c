@@ -155,7 +155,50 @@ void VfsSetCurrentProcess(struct VfsProcess *process) {
   g_vfs_process = process;
 }
 
+void VfsDebugDumpProcessFds(const char *label, struct VfsProcess *process) {
+  struct Dll *e;
+
+  if (!process) {
+    fprintf(stderr, "[vfs-fds] %s <null>\n", label ? label : "process");
+    fflush(stderr);
+    return;
+  }
+  fprintf(stderr, "[vfs-fds] %s process=%p\n", label ? label : "process",
+          (void *)process);
+  LOCK(&process->lock);
+  for (e = dll_first(process->fds); e; e = dll_next(process->fds, e)) {
+    struct VfsFd *vfsfd = VFS_FD_CONTAINER(e);
+    int hostfd = -1;
+    if (vfsfd->data && vfsfd->data->device && vfsfd->data->device->ops == &g_hostfs.ops &&
+        vfsfd->data->data) {
+      hostfd = ((struct HostfsInfo *)vfsfd->data->data)->filefd;
+    }
+    fprintf(stderr,
+            "[vfs-fds]   fd=%d hostfd=%d info=%p dev=%u ino=%" PRIu64
+            " mode=%#o\n",
+            vfsfd->fd, hostfd, (void *)vfsfd->data,
+            vfsfd->data ? vfsfd->data->dev : 0,
+            vfsfd->data ? vfsfd->data->ino : 0,
+            vfsfd->data ? vfsfd->data->mode : 0);
+  }
+  UNLOCK(&process->lock);
+  fflush(stderr);
+}
+
+void VfsDebugDumpBootstrapFds(const char *label) {
+  VfsDebugDumpProcessFds(label ? label : "bootstrap",
+                         &g_vfs_bootstrap_process);
+}
+
 static void VfsCloseAllForProcess(struct VfsProcess *process);
+
+static void VfsDisposeDetachedInfo(struct VfsInfo *info) {
+  if (!info) return;
+  if (info->device->ops && info->device->ops->Close) {
+    (void)info->device->ops->Close(info);
+  }
+  unassert(!VfsFreeInfo(info));
+}
 
 static int VfsInitProcessState(struct VfsProcess *process) {
   int err;
@@ -1102,12 +1145,14 @@ static int VfsSetFdForProcess(struct VfsProcess *process, int fd,
                               struct VfsInfo *data) {
   struct Dll *e;
   struct VfsFd *vfsfd;
+  struct VfsInfo *oldinfo = NULL;
   LOCK(&process->lock);
   for (e = dll_first(process->fds); e; e = dll_next(process->fds, e)) {
     if (VFS_FD_CONTAINER(e)->fd == fd) {
-      unassert(!VfsFreeInfo(VFS_FD_CONTAINER(e)->data));
+      oldinfo = VFS_FD_CONTAINER(e)->data;
       VFS_FD_CONTAINER(e)->data = data;
       UNLOCK(&process->lock);
+      VfsDisposeDetachedInfo(oldinfo);
       return 0;
     } else if (VFS_FD_CONTAINER(e)->fd > fd) {
       break;
@@ -2280,7 +2325,7 @@ int VfsDup2(int fd, int newfd) {
     return -1;
   }
   if (VfsFreeFd(newfd, &newinfo) == 0) {
-    unassert(!VfsFreeInfo(newinfo));
+    VfsDisposeDetachedInfo(newinfo);
   }
   if (info->device->ops->Dup) {
     ret = info->device->ops->Dup(info, &newinfo);
@@ -3316,8 +3361,8 @@ int VfsPipe(int fds[2]) {
   }
   if ((fds[1] = VfsAddFd(infos[1])) == -1) {
     VfsFreeFd(fds[0], &infos[0]);
-    VfsFreeInfo(infos[0]);
-    VfsFreeInfo(infos[1]);
+    VfsDisposeDetachedInfo(infos[0]);
+    VfsDisposeDetachedInfo(infos[1]);
     return -1;
   }
   return 0;
@@ -3341,8 +3386,8 @@ int VfsPipe2(int fds[2], int flags) {
   }
   if ((fds[1] = VfsAddFd(infos[1])) == -1) {
     VfsFreeFd(fds[0], &infos[0]);
-    VfsFreeInfo(infos[0]);
-    VfsFreeInfo(infos[1]);
+    VfsDisposeDetachedInfo(infos[0]);
+    VfsDisposeDetachedInfo(infos[1]);
     return -1;
   }
   return 0;
@@ -3379,8 +3424,8 @@ int VfsSocketpair(int domain, int type, int protocol, int fds[2]) {
   }
   if ((fds[1] = VfsAddFd(infos[1])) == -1) {
     VfsFreeFd(fds[0], &infos[0]);
-    VfsFreeInfo(infos[0]);
-    VfsFreeInfo(infos[1]);
+    VfsDisposeDetachedInfo(infos[0]);
+    VfsDisposeDetachedInfo(infos[1]);
     return -1;
   }
   return 0;

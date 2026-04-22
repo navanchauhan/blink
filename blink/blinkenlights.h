@@ -17,7 +17,7 @@ extern int ttyin;
 extern int vidya;
 extern bool tuimode;
 extern struct Pty *pty;
-extern struct Machine *m;
+extern _Thread_local struct Machine *m;
 extern bool ptyisenabled;
 
 void SetCarry(bool cf);
