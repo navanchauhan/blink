@@ -53,6 +53,12 @@
 #include <TargetConditionals.h>
 #endif
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define BLINK_THREAD_WAKE_SIGNAL SIGURG
+#else
+#define BLINK_THREAD_WAKE_SIGNAL SIGSYS
+#endif
+
 #include "blink/ancillary.h"
 #include "blink/assert.h"
 #include "blink/atomic.h"
@@ -5361,13 +5367,13 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
          e = dll_next(m->system->machines, e)) {
       struct Machine *m2;
       m2 = MACHINE_CONTAINER(e);
-      if (m2->tid == tid) {
-        if (sig) {
-          EnqueueSignal(m2, sig);
-          err = pthread_kill(m2->thread, SIGSYS);
-        } else {
-          err = pthread_kill(m2->thread, 0);
-        }
+        if (m2->tid == tid) {
+          if (sig) {
+            EnqueueSignal(m2, sig);
+            err = pthread_kill(m2->thread, BLINK_THREAD_WAKE_SIGNAL);
+          } else {
+            err = pthread_kill(m2->thread, 0);
+          }
         found = true;
         break;
       }

@@ -20,6 +20,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #include "blink/assert.h"
 #include "blink/atomic.h"
@@ -43,6 +46,12 @@
 #include "blink/util.h"
 #include "blink/vfs.h"
 #include "blink/x86.h"
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define BLINK_THREAD_WAKE_SIGNAL SIGURG
+#else
+#define BLINK_THREAD_WAKE_SIGNAL SIGSYS
+#endif
 
 struct Allocator {
   pthread_mutex_t_ lock;
@@ -337,7 +346,7 @@ StartOver:
         atomic_store_explicit(&m->killed, true, memory_order_release);
         atomic_store_explicit(&m->attention, true, memory_order_release);
         if (t < tries_before_force) {
-          pthread_kill(m->thread, SIGSYS);
+          pthread_kill(m->thread, BLINK_THREAD_WAKE_SIGNAL);
         } else if (s->embedded_exit_fastpath) {
           LOGF("detaching thread after %d tries during embedded exit",
                tries_before_force);
